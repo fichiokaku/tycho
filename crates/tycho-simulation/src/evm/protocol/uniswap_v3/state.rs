@@ -222,10 +222,11 @@ impl UniswapV3State {
 
             gas_used = gas_used.wrapping_add(U256::from(GAS_PER_SWAP_MATH_STEP));
 
-            // SAFETY: compute_swap_step bounds amount_in below 2^193 (u128 liquidity times
-            // in-range Q64.96 sqrt-price ratios) and fee_amount by
-            // max(|amount_remaining| <= 2^255, amount_in * fee_pips < 2^225), so the sum stays
-            // below 2^256 and cannot wrap.
+            // SAFETY: amount_in comes from get_amount{0,1}_delta, bounded by the swap-math domain
+            // at ~liquidity << 96 < 2^224; fee_amount is either |amount_remaining| <= 2^255
+            // (exact-input non-max branch) or amount_in * fee_pips / (1e6 - fee_pips) < 2^244, so
+            // the sum stays below 2^256. The debug_assert is the operative guard if those bounds
+            // ever change.
             let amount_in_plus_fee = step
                 .amount_in
                 .wrapping_add(step.fee_amount);
@@ -446,9 +447,10 @@ impl ProtocolSim for UniswapV3State {
             };
 
             // Accumulate total amounts for this tick range
-            // SAFETY: each per-tick delta is < 2^193 (u128 liquidity times in-range Q64.96
-            // sqrt-price ratios) and iteration is capped at MAX_TICKS_CROSSED (< 2^10), so the
-            // running totals stay far below 2^256 and cannot wrap.
+            // SAFETY: each per-tick delta is bounded by the swap-math domain (~liquidity << 96 <
+            // 2^224) and iteration is capped at MAX_TICKS_CROSSED (< 2^10), so the running totals
+            // stay far below 2^256. The debug_assert below is a per-step backstop: it catches a
+            // wrap on any single addition (the result can only drop below its addend on wrap).
             total_amount_in = total_amount_in.wrapping_add(amount_in);
             total_amount_out = total_amount_out.wrapping_add(amount_out);
             debug_assert!(

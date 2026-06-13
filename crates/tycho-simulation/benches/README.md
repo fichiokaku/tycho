@@ -19,8 +19,6 @@ benches/
     pool_universe.json# candidate pool addresses (from a Dune top-volume query)
     index.json        # list of snapshots + fetch block
     <PAIR>_<fee>.json # one snapshot per pool
-tests/
-  clmm_replay.rs      # output-equality + determinism tests (reuses benches/common)
 ```
 
 ## The `BenchQuoter` abstraction
@@ -96,17 +94,18 @@ hides no-work bailouts — and (b) stratum degeneracy (>50% identical amounts in
 stratum). Partial fills (the `Ticks exceeded` path, which still carries a real
 swap) are counted and reported, not rejected.
 
-## Output-equality replay
+## Output-equality gate
 
-`tests/clmm_replay.rs` runs the identical seeded, validated sequence through every
-registered quoter and asserts `QuoteOutput::equivalent` per input: same fill/bail
-classification, and for fills identical amount, gas, partial flag, and resulting
-pool state (compared via `ProtocolSim::eq`, which covers sqrt_price, tick,
-liquidity, and ticks). This is the acceptance gate for candidates. It currently
-runs reference-vs-reference (self-consistency + plumbing).
+The bit-exactness acceptance gate is the differential capture in
+`src/evm/protocol/clmm_capture.rs`, not a bench. It dumps the full observable result
+(`swap` + `get_limits`: amount, gas, partial flag, and post-swap `{sqrt_price, tick,
+liquidity, ticks}`) for every CLMM protocol over a fixed seeded corpus, one line per
+case. Run it on two commits and `cmp` the dumps; byte-identical proves the change
+altered nothing observable.
 
 ```bash
-cargo test -p tycho-simulation --test clmm_replay
+CLMM_CAPTURE_PATH=/tmp/before.jsonl cargo test -p tycho-simulation --release \
+    capture_clmm_outputs -- --ignored --nocapture
 ```
 
 ## Comparison workflow (reference vs. candidate)
