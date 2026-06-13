@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ekubo_sdk::{
     chain::evm::{
@@ -25,7 +28,11 @@ const COMPLETE_PAYMENT_GAS_COST: u64 = 2_000;
 const TRANSFER_FROM_USER_GAS_COST: u64 = 20_000;
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct StableswapPool {
-    imp: EvmStableswapPool,
+    // C1: the SDK pool lives behind an `Arc` so building the post-swap `new_state` in `quote` is a
+    // refcount bump instead of a deep copy. `imp` is read-only in `quote`/`get_limit`, so no
+    // copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmStableswapPool>,
     swap_state: StableswapPoolSwapState,
 }
 
@@ -40,7 +47,10 @@ impl StableswapPool {
         sdk_state: EvmStableswapPoolState,
     ) -> Result<Self, InvalidSnapshotError> {
         EvmStableswapPool::new(key, sdk_state)
-            .map(|imp| Self { swap_state: StableswapPoolSwapState { sdk_state }, imp })
+            .map(|imp| Self {
+                swap_state: StableswapPoolSwapState { sdk_state },
+                imp: Arc::new(imp),
+            })
             .map_err(|err| {
                 InvalidSnapshotError::ValueError(format!("creating stableswap pool: {err:?}"))
             })
@@ -85,7 +95,7 @@ impl EkuboPool for StableswapPool {
                 calculated_amount: quote.calculated_amount,
                 gas: Self::gas_costs(),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: StableswapPoolSwapState { sdk_state: quote.state_after },
                 }
                 .into(),

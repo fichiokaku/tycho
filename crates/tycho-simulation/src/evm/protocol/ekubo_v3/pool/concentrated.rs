@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     convert::identity,
+    sync::Arc,
 };
 
 use ekubo_sdk::{
@@ -46,7 +47,12 @@ const GAS_COST_OF_ONE_EXTRA_MATH_ROUND: u64 = 4_076;
 
 #[derive(Debug, Clone, Eq, Serialize, Deserialize)]
 pub struct ConcentratedPool {
-    imp: EvmConcentratedPool,
+    // C1: the SDK pool (which owns the `Vec<Tick>`) lives behind an `Arc` so building the
+    // post-swap `new_state` in `quote` is a refcount bump instead of a deep copy of the tick Vec.
+    // `imp` is read-only in `quote`/`get_limit` and replaced wholesale in `finish_transition`, so
+    // no copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmConcentratedPool>,
     swap_state: ConcentratedPoolSwapState,
 }
 
@@ -64,9 +70,9 @@ impl ConcentratedPool {
         ticks: Vec<Tick>,
     ) -> Result<Self, InvalidSnapshotError> {
         Ok(Self {
-            imp: impl_from_state(key, sdk_state, ticks).map_err(|err| {
+            imp: Arc::new(impl_from_state(key, sdk_state, ticks).map_err(|err| {
                 InvalidSnapshotError::ValueError(format!("creating concentrated pool: {err:?}"))
-            })?,
+            })?),
             swap_state: ConcentratedPoolSwapState { sdk_state, active_tick: Some(tick) },
         })
     }
@@ -102,7 +108,7 @@ impl EkuboPool for ConcentratedPool {
                 calculated_amount: quote.calculated_amount,
                 gas: gas_costs(quote.execution_resources),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: ConcentratedPoolSwapState {
                         sdk_state: quote.state_after,
                         active_tick: None,
@@ -114,7 +120,14 @@ impl EkuboPool for ConcentratedPool {
     }
 
     fn get_limit(&self, token_in: Address) -> Result<i128, SimulationError> {
-        get_limit(token_in, self.sqrt_ratio(), &self.imp, self.swap_state.sdk_state, (), identity)
+        get_limit(
+            token_in,
+            self.sqrt_ratio(),
+            self.imp.as_ref(),
+            self.swap_state.sdk_state,
+            (),
+            identity,
+        )
     }
 
     fn finish_transition(
@@ -131,13 +144,15 @@ impl EkuboPool for ConcentratedPool {
         )?;
 
         if let Some(ticks) = updated_ticks {
-            self.imp = impl_from_state(self.imp.key(), self.swap_state.sdk_state, ticks).map_err(
-                |err| {
-                    TransitionError::SimulationError(SimulationError::RecoverableError(format!(
-                        "reinstantiate base pool: {err:?}"
-                    )))
-                },
-            )?;
+            self.imp = Arc::new(
+                impl_from_state(self.imp.key(), self.swap_state.sdk_state, ticks).map_err(
+                    |err| {
+                        TransitionError::SimulationError(SimulationError::RecoverableError(
+                            format!("reinstantiate base pool: {err:?}"),
+                        ))
+                    },
+                )?,
+            );
         }
 
         Ok(())

@@ -20,6 +20,29 @@ use tycho_common::{
 };
 
 use super::state::EkuboV3State;
+
+/// Serializes an `Arc`-wrapped SDK pool as its inner value, so wrapping `imp` in an `Arc` (to make
+/// the per-quote `new_state` clone a refcount bump instead of a tick-`Vec` copy) leaves the
+/// serialized form identical to the pre-`Arc` representation.
+pub(super) mod arc_imp {
+    use std::sync::Arc;
+
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(crate) fn serialize<T: Serialize, S: Serializer>(
+        imp: &Arc<T>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        T::serialize(imp.as_ref(), serializer)
+    }
+
+    pub(crate) fn deserialize<'de, T: Deserialize<'de>, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Arc<T>, D::Error> {
+        T::deserialize(deserializer).map(Arc::new)
+    }
+}
+
 pub struct EkuboPoolQuote {
     pub consumed_amount: i128,
     pub calculated_amount: u128,
