@@ -11,6 +11,7 @@
 use std::{
     any::Any,
     collections::HashMap,
+    sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -1013,8 +1014,21 @@ fn from_adjusted_amount(adjusted_amount: U256, decimals: i64) -> U256 {
     }
 }
 
+// 10^0 .. 10^77 — the full range of powers of ten that fit in a U256 (10^78 > 2^256). Decimal
+// scaling in the swap math calls `ten_pow` several times per quote with a small positive
+// decimals-difference exponent, so caching the table replaces a per-call `U256::pow` (a
+// log2(v)-multiply ladder) with an array index. Entries are the exact `U256::from(10).pow(..)`
+// values, so the table is bit-identical to recomputing.
+static TEN_POW: LazyLock<[U256; 78]> =
+    LazyLock::new(|| std::array::from_fn(|i| U256::from(10u64).pow(U256::from(i as u64))));
+
 fn ten_pow(v: i64) -> U256 {
-    U256::from(10u64).pow(U256::from((v) as u64))
+    if (0..TEN_POW.len() as i64).contains(&v) {
+        TEN_POW[v as usize]
+    } else {
+        // Out-of-table exponents (incl. negatives via the u64 cast) keep the original behavior.
+        U256::from(10u64).pow(U256::from(v as u64))
+    }
 }
 
 /// Checks if token0 reserves are sufficient compared to token1 reserves.
@@ -1245,6 +1259,19 @@ mod test {
     use anyhow::bail;
     use num_traits::Num;
     use tycho_common::models::Chain;
+
+    /// The cached table must be bit-identical to the original runtime computation across the full
+    /// in-table domain plus out-of-table exponents that exercise the fallback.
+    #[test]
+    fn ten_pow_matches_runtime_computation() {
+        for v in 0..=200i64 {
+            assert_eq!(
+                super::ten_pow(v),
+                U256::from(10u64).pow(U256::from(v as u64)),
+                "ten_pow({v}) diverged from runtime pow",
+            );
+        }
+    }
 
     use super::*;
 
