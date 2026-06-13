@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ekubo_sdk::{
     chain::evm::{
@@ -35,7 +38,12 @@ const GAS_COST_OF_FEE_ACCUMULATION: u64 = 19_279;
 
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct BoostedFeesPool {
-    imp: EvmBoostedFeesConcentratedPool,
+    // C1: the SDK pool (which owns the `Vec<Tick>` and donate-rate-delta Vec) lives behind an
+    // `Arc` so building the post-swap `new_state` in `quote` is a refcount bump instead of a
+    // deep copy. `imp` is read-only in `quote`/`get_limit` and replaced wholesale in
+    // `finish_transition`, so no copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmBoostedFeesConcentratedPool>,
     swap_state: BoostedFeesPoolSwapState,
 }
 
@@ -69,7 +77,7 @@ impl BoostedFeesPool {
             ticks,
         )
         .map(|imp| Self {
-            imp,
+            imp: Arc::new(imp),
             swap_state: BoostedFeesPoolSwapState {
                 sdk_state: EvmBoostedFeesConcentratedPoolState {
                     concentrated_pool_state: concentrated_sdk_state,
@@ -130,7 +138,7 @@ impl EkuboPool for BoostedFeesPool {
                 calculated_amount: quote.calculated_amount,
                 gas: gas_costs(quote.execution_resources),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: BoostedFeesPoolSwapState {
                         sdk_state: quote.state_after,
                         swapped_this_block: true,
@@ -151,7 +159,7 @@ impl EkuboPool for BoostedFeesPool {
             sdk_state
                 .concentrated_pool_state
                 .sqrt_ratio,
-            &self.imp,
+            self.imp.as_ref(),
             sdk_state,
             self.swap_state.last_real_time, // Timestamp doesn't affect the calculated amount
             |r| r.concentrated,
@@ -202,25 +210,27 @@ impl EkuboPool for BoostedFeesPool {
         if ticks.is_some() || donate_rate_deltas.is_some() {
             let sdk_state = self.swap_state.sdk_state;
 
-            self.imp = impl_from_state(
-                self.imp.key(),
-                sdk_state.concentrated_pool_state,
-                sdk_state.donate_rate0,
-                sdk_state.donate_rate1,
-                self.swap_state.last_real_time,
-                donate_rate_deltas.unwrap_or_else(|| self.imp.donate_rate_deltas().clone()),
-                ticks.unwrap_or_else(|| {
-                    self.imp
-                        .concentrated_pool()
-                        .ticks()
-                        .to_vec()
-                }),
-            )
-            .map_err(|err| {
-                TransitionError::SimulationError(SimulationError::RecoverableError(format!(
-                    "reinstantiate BoostedFees pool: {err:?}"
-                )))
-            })?;
+            self.imp = Arc::new(
+                impl_from_state(
+                    self.imp.key(),
+                    sdk_state.concentrated_pool_state,
+                    sdk_state.donate_rate0,
+                    sdk_state.donate_rate1,
+                    self.swap_state.last_real_time,
+                    donate_rate_deltas.unwrap_or_else(|| self.imp.donate_rate_deltas().clone()),
+                    ticks.unwrap_or_else(|| {
+                        self.imp
+                            .concentrated_pool()
+                            .ticks()
+                            .to_vec()
+                    }),
+                )
+                .map_err(|err| {
+                    TransitionError::SimulationError(SimulationError::RecoverableError(format!(
+                        "reinstantiate BoostedFees pool: {err:?}"
+                    )))
+                })?,
+            );
         }
 
         self.swap_state.swapped_this_block = false;

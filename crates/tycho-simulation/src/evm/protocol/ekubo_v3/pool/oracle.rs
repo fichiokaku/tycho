@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ekubo_sdk::{
     chain::evm::{
@@ -28,7 +31,11 @@ const GAS_COST_OF_UPDATING_SNAPSHOT: u64 = 9_709;
 
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct OraclePool {
-    imp: EvmOraclePool,
+    // C1: the SDK pool lives behind an `Arc` so building the post-swap `new_state` in `quote` is a
+    // refcount bump instead of a deep copy. `imp` is read-only in `quote`/`get_limit` and never
+    // replaced in `finish_transition`, so no copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmOraclePool>,
     swap_state: OraclePoolSwapState,
 }
 
@@ -52,7 +59,7 @@ impl OraclePool {
             0,
         )
         .map(|imp| Self {
-            imp,
+            imp: Arc::new(imp),
             swap_state: OraclePoolSwapState {
                 sdk_state: full_range_sdk_state,
                 swapped_this_block: false,
@@ -97,7 +104,7 @@ impl EkuboPool for OraclePool {
                 calculated_amount: quote.calculated_amount,
                 gas: gas_costs(quote.execution_resources),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: OraclePoolSwapState {
                         sdk_state: quote.state_after.full_range_pool_state,
                         swapped_this_block: true,

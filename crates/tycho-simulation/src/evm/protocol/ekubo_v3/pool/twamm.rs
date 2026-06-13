@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use alloy::eips::merge::SLOT_DURATION_SECS;
 use ekubo_sdk::{
@@ -36,7 +39,12 @@ const GAS_COST_OF_CROSSING_ONE_VIRTUAL_ORDER_DELTA: u64 = 19_980;
 
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct TwammPool {
-    imp: EvmTwammPool,
+    // C1: the SDK pool (which owns the virtual-order-delta Vec) lives behind an `Arc` so building
+    // the post-swap `new_state` in `quote` is a refcount bump instead of a deep copy. `imp` is
+    // read-only in `quote`/`get_limit` and replaced wholesale in `finish_transition`, so no
+    // copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmTwammPool>,
     swap_state: TwammPoolSwapState,
 }
 
@@ -73,7 +81,7 @@ impl TwammPool {
     ) -> Result<Self, InvalidSnapshotError> {
         impl_from_state(key, sdk_state, virtual_order_deltas)
             .map(|imp| Self {
-                imp,
+                imp: Arc::new(imp),
                 swap_state: TwammPoolSwapState { sdk_state, swapped_this_block: false },
             })
             .map_err(|err| {
@@ -128,7 +136,7 @@ impl EkuboPool for TwammPool {
                 calculated_amount: quote.calculated_amount,
                 gas: gas_costs(quote.execution_resources),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: TwammPoolSwapState {
                         sdk_state: quote.state_after,
                         swapped_this_block: true,
@@ -236,12 +244,14 @@ impl EkuboPool for TwammPool {
         }
 
         if let Some(sale_rate_deltas) = sale_rate_deltas {
-            self.imp = impl_from_state(self.imp.key(), self.swap_state.sdk_state, sale_rate_deltas)
-                .map_err(|err| {
-                    TransitionError::SimulationError(SimulationError::RecoverableError(format!(
-                        "reinstantiate TWAMM pool: {err:?}"
-                    )))
-                })?;
+            self.imp = Arc::new(
+                impl_from_state(self.imp.key(), self.swap_state.sdk_state, sale_rate_deltas)
+                    .map_err(|err| {
+                        TransitionError::SimulationError(SimulationError::RecoverableError(
+                            format!("reinstantiate TWAMM pool: {err:?}"),
+                        ))
+                    })?,
+            );
         }
 
         self.swap_state.swapped_this_block = false;

@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use ekubo_sdk::{
     chain::evm::{
@@ -29,7 +32,12 @@ const GAS_COST_OF_ONE_STATE_UPDATE: u64 = 16_418;
 
 #[derive(Debug, Eq, Clone, Serialize, Deserialize)]
 pub struct MevCapturePool {
-    imp: EvmMevCapturePool,
+    // C1: the SDK pool (which owns the `Vec<Tick>`) lives behind an `Arc` so building the
+    // post-swap `new_state` in `quote` is a refcount bump instead of a deep copy of the tick Vec.
+    // `imp` is read-only in `quote`/`get_limit` and replaced wholesale in `finish_transition`, so
+    // no copy-on-write is needed.
+    #[serde(with = "super::arc_imp")]
+    imp: Arc<EvmMevCapturePool>,
     swap_state: MevCapturePoolSwapState,
 }
 
@@ -49,7 +57,7 @@ impl MevCapturePool {
     ) -> Result<Self, InvalidSnapshotError> {
         impl_from_state(key, concentrated_state, ticks, tick)
             .map(|imp| Self {
-                imp,
+                imp: Arc::new(imp),
                 swap_state: MevCapturePoolSwapState {
                     sdk_state: concentrated_state,
                     active_tick: Some(tick),
@@ -97,7 +105,7 @@ impl EkuboPool for MevCapturePool {
                 calculated_amount: quote.calculated_amount,
                 gas: gas_costs(quote.execution_resources),
                 new_state: Self {
-                    imp: self.imp.clone(),
+                    imp: Arc::clone(&self.imp),
                     swap_state: MevCapturePoolSwapState {
                         sdk_state: quote
                             .state_after
@@ -115,7 +123,7 @@ impl EkuboPool for MevCapturePool {
         concentrated::get_limit(
             token_in,
             self.sqrt_ratio(),
-            &self.imp,
+            self.imp.as_ref(),
             EvmMevCapturePoolState {
                 last_update_time: 0,
                 concentrated_pool_state: self.swap_state.sdk_state,
@@ -143,17 +151,19 @@ impl EkuboPool for MevCapturePool {
         }
 
         if let Some(new_ticks) = ticks {
-            self.imp = impl_from_state(
-                self.imp.key(),
-                self.swap_state.sdk_state,
-                new_ticks,
-                self.swap_state.last_tick,
-            )
-            .map_err(|err| {
-                TransitionError::SimulationError(SimulationError::RecoverableError(format!(
-                    "reinstantiate MEVCapture pool: {err:?}"
-                )))
-            })?;
+            self.imp = Arc::new(
+                impl_from_state(
+                    self.imp.key(),
+                    self.swap_state.sdk_state,
+                    new_ticks,
+                    self.swap_state.last_tick,
+                )
+                .map_err(|err| {
+                    TransitionError::SimulationError(SimulationError::RecoverableError(format!(
+                        "reinstantiate MEVCapture pool: {err:?}"
+                    )))
+                })?,
+            );
         }
 
         Ok(())
