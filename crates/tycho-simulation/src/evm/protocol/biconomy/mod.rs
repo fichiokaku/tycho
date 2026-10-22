@@ -369,8 +369,9 @@ mod tests {
 
     /// Rebuilds the state from the executor's and venue's raw storage on Base Sepolia, the words
     /// the substreams package indexes, and checks every maker's board against
-    /// `PropAMMExecutor.board()` and every quote against `PropAMMVenue.quote` at the same block.
-    /// Needs `BASE_SEPOLIA_RPC_URL` (an archive node) and the deployment in `deployment` below.
+    /// `PropAMMExecutor.board()`, and every size against `PropAMMVenue.quote` and `quoteFillable`
+    /// (and the limits against `quoteFillable` of everything) at the same block. Needs
+    /// `BASE_SEPOLIA_RPC_URL` (an archive node) and the deployment in `deployment` below.
     #[cfg(feature = "network_tests")]
     mod network {
         use std::{collections::BTreeMap, env, str::FromStr};
@@ -383,25 +384,37 @@ mod tests {
             sol,
             sol_types::SolCall,
         };
+        use futures::future::join_all;
 
         use super::*;
-        use crate::evm::protocol::biconomy::{
-            decoder::{apply_attributes, board_key, hex_address, AttributeChange},
-            math::BOARD_WORDS,
-            state::BlockEnvState,
+        use crate::evm::protocol::{
+            biconomy::{
+                decoder::{apply_attributes, board_key, hex_address, AttributeChange},
+                math::{after_protocol_fee, merge, BOARD_WORDS},
+                state::BlockEnvState,
+            },
+            u256_num::{biguint_to_u256, u256_to_biguint},
         };
 
         /// The deployment the test reads, the one place to edit for a new generation.
         mod deployment {
             pub const UNSET: &str = "0x0000000000000000000000000000000000000000";
-            /// `PropAMMVenue` on Base Sepolia (84532). Next generation: not deployed yet.
-            pub const VENUE: &str = UNSET;
-            /// `PropAMMExecutor` on Base Sepolia (84532). Next generation: not deployed yet.
-            pub const EXECUTOR: &str = UNSET;
-            /// Blocks to compare at. Pick blocks with live boards in both directions, blocks with
-            /// fills (a fill and a version bump in one block exercise the per-block budget), and
-            /// a block where an anchor's 16-bit commit block has wrapped.
-            pub const BLOCKS: &[u64] = &[];
+            /// `PropAMMVenue` on Base Sepolia (84532), release candidate v1.0.0-rc.1 (efcb89b).
+            pub const VENUE: &str = "0x000000d88b78dC90957BaAF474E771f739926994";
+            /// `PropAMMExecutor` on Base Sepolia (84532), release candidate v1.0.0-rc.1.
+            pub const EXECUTOR: &str = "0x000000B46d7076bc859572154786e2858E1f9A41";
+            /// Blocks to compare at, across the release candidate's end-to-end run (200 ms
+            /// blocks): the price board's commit (48836773), the offset board's commit before
+            /// its anchor (48836779) and with it (48836784), a venue swap's block and the next
+            /// (48836804, 48836805), a hosted fill (48836819), the controls commit inside its
+            /// one-block premium (48836824) and after (48836825), a venue swap under the
+            /// controls' block cap and the next block (48836841, 48836842), then widening ages
+            /// of up to ~1,700 blocks.
+            pub const BLOCKS: &[u64] = &[
+                48_836_773, 48_836_779, 48_836_784, 48_836_790, 48_836_804, 48_836_805, 48_836_819,
+                48_836_824, 48_836_825, 48_836_841, 48_836_842, 48_836_900, 48_837_000, 48_837_500,
+                48_838_000, 48_838_500,
+            ];
             /// Tokens of the venue's pairs: address, symbol, decimals and the `balanceOf` and
             /// `allowance` mapping slots. Base Sepolia MockWETH and MockUSDC are OpenZeppelin
             /// ERC20s (slots 0 and 1), both with 18 decimals.
@@ -419,24 +432,16 @@ mod tests {
                         1_000_000,
                         1_000_000_000_000,
                         1_000_000_000_000_000,
-                        10_000_000_000_000_000,
                         100_000_000_000_000_000,
+                        500_000_000_000_000_000,
+                        600_000_000_000_000_001,
                         1_000_000_000_000_000_000,
+                        2_000_000_000_000_000_000,
+                        3_000_000_000_000_000_000,
+                        6_000_000_000_000_000_000,
                     ],
                 ),
-                (
-                    1,
-                    0,
-                    &[
-                        1,
-                        1_000_000,
-                        1_000_000_000_000,
-                        1_000_000_000_000_000_000,
-                        10_000_000_000_000_000_000,
-                        100_000_000_000_000_000_000,
-                        1_000_000_000_000_000_000_000,
-                    ],
-                ),
+                (1, 0, &[1, 1_000_000_000_000_000_000, 2_000_000_000_000_000_000_000]),
             ];
         }
 
@@ -445,6 +450,7 @@ mod tests {
 
         sol! {
             function quote(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256);
+            function quoteFillable(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256 fillableAmountIn, uint256 amountOut);
             function board(address mm, address tokenIn, address tokenOut) external view returns (uint256[] memory sizes, uint256[] memory prices, uint256 filled, uint256 remaining, uint256 expiresAt, uint256 nonce, uint256 anchorNonce, uint8 mode);
             function available(address token) external view returns (uint256);
             function signer() external view returns (address);
@@ -475,6 +481,19 @@ mod tests {
                 .map(|out| out.to_vec())
         }
 
+        async fn storage<P: Provider>(
+            provider: &P,
+            contract: Address,
+            slot: U256,
+            block: u64,
+        ) -> U256 {
+            provider
+                .get_storage_at(contract, slot)
+                .block_id(BlockId::number(block))
+                .await
+                .unwrap()
+        }
+
         fn tokens() -> Vec<(Token, u8, u8)> {
             deployment::TOKENS
                 .iter()
@@ -486,6 +505,62 @@ mod tests {
 
         fn address_of(token: &Token) -> Address {
             Address::from_slice(token.address.as_ref())
+        }
+
+        /// `PropAMMVenue.quoteFillable` replayed on the state: the covered part of `amount_in`
+        /// and its output net of the fee, re-planned at the covered amount when short.
+        fn quote_fillable(
+            state: &BiconomyState,
+            token_in: &Token,
+            token_out: &Token,
+            amount_in: U256,
+        ) -> (U256, U256) {
+            if amount_in.is_zero() {
+                return (U256::ZERO, U256::ZERO);
+            }
+            let (_, views) = state
+                .board_views(&address_of(token_in).0 .0, &address_of(token_out).0 .0)
+                .unwrap();
+            let mut plan = merge(&views, amount_in);
+            if plan.covered < amount_in {
+                let capacity = plan.covered;
+                if capacity.is_zero() {
+                    return (U256::ZERO, U256::ZERO);
+                }
+                plan = merge(&views, capacity);
+                if plan.covered != capacity {
+                    return (U256::ZERO, U256::ZERO);
+                }
+            }
+            if plan.out.is_zero() {
+                return (U256::ZERO, U256::ZERO);
+            }
+            (plan.covered, after_protocol_fee(plan.out, state.fee_bps))
+        }
+
+        /// One board's 24 words; only the header is read for a board never committed.
+        async fn board_words<P: Provider>(
+            provider: &P,
+            executor: Address,
+            base: U256,
+            block: u64,
+        ) -> BTreeMap<u8, U256> {
+            let mut words = BTreeMap::new();
+            let header = storage(provider, executor, base, block).await;
+            if header.is_zero() {
+                return words;
+            }
+            words.insert(0, header);
+            let rest = join_all(
+                (1..BOARD_WORDS).map(|i| storage(provider, executor, base + U256::from(i), block)),
+            )
+            .await;
+            for (i, value) in (1..BOARD_WORDS).zip(rest) {
+                if !value.is_zero() {
+                    words.insert(i, value);
+                }
+            }
+            words
         }
 
         /// The state the substreams package indexes, rebuilt from storage at `block`: venue
@@ -504,30 +579,25 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .header;
-            let storage = |contract: Address, slot: U256| async move {
-                provider
-                    .get_storage_at(contract, slot)
-                    .block_id(BlockId::number(block))
-                    .await
-                    .unwrap()
-            };
 
             let mut state = BiconomyState {
                 block: BlockEnvState { number: block, timestamp: header.timestamp },
                 ..Default::default()
             };
             let makers_slot = U256::from(VENUE_MAKERS_SLOT);
+            let count = storage(provider, venue, makers_slot, block).await;
             let mut attributes: Vec<(String, Bytes)> = vec![
-                ("fee_bps".to_owned(), word(storage(venue, U256::ZERO).await)),
-                ("maker_count".to_owned(), word(storage(venue, makers_slot).await)),
+                ("fee_bps".to_owned(), word(storage(provider, venue, U256::ZERO, block).await)),
+                ("maker_count".to_owned(), word(count)),
             ];
-            let count = storage(venue, makers_slot)
-                .await
-                .to::<u64>();
             let first = U256::from_be_bytes(keccak256(makers_slot.to_be_bytes::<32>()).0);
+            let entries = join_all(
+                (0..count.to::<u64>())
+                    .map(|i| storage(provider, venue, first + U256::from(i), block)),
+            )
+            .await;
             let mut makers = Vec::new();
-            for i in 0..count {
-                let value = storage(venue, first + U256::from(i)).await;
+            for (i, value) in entries.into_iter().enumerate() {
                 makers.push(Address::from_slice(&value.to_be_bytes::<32>()[12..]));
                 attributes.push((format!("maker/{i}"), word(value)));
             }
@@ -537,7 +607,7 @@ mod tests {
                 .map(|(token, _, _)| address_of(token))
                 .collect();
             for mm in &makers {
-                if !storage(executor, slot(*mm, U256::from(2u8)))
+                if !storage(provider, executor, slot(*mm, U256::from(2u8)), block)
                     .await
                     .is_zero()
                 {
@@ -546,20 +616,19 @@ mod tests {
                 for (i, a) in addresses.iter().enumerate() {
                     for b in &addresses[i + 1..] {
                         let (t0, t1) = if a < b { (*a, *b) } else { (*b, *a) };
-                        let anchor =
-                            storage(executor, slot(t1, slot(t0, slot(*mm, U256::from(1u8))))).await;
+                        let anchor = storage(
+                            provider,
+                            executor,
+                            slot(t1, slot(t0, slot(*mm, U256::from(1u8)))),
+                            block,
+                        )
+                        .await;
                         state
                             .anchors
                             .insert(board_key(&mm.0 .0, &t0.0 .0, &t1.0 .0), anchor);
                         for (tin, tout) in [(*a, *b), (*b, *a)] {
                             let base = slot(tout, slot(tin, slot(*mm, U256::ZERO)));
-                            let mut words = BTreeMap::new();
-                            for i in 0..BOARD_WORDS {
-                                let value = storage(executor, base + U256::from(i)).await;
-                                if !value.is_zero() {
-                                    words.insert(i, value);
-                                }
-                            }
+                            let words = board_words(provider, executor, base, block).await;
                             let board_provider = Address::from_slice(
                                 &words
                                     .get(&0)
@@ -612,9 +681,13 @@ mod tests {
                                 let token = address_of(token);
                                 let holder = vault.unwrap_or(board_provider);
                                 if kind != 2 {
-                                    let value =
-                                        storage(token, slot(holder, U256::from(*balance_slot)))
-                                            .await;
+                                    let value = storage(
+                                        provider,
+                                        token,
+                                        slot(holder, U256::from(*balance_slot)),
+                                        block,
+                                    )
+                                    .await;
                                     attributes.push((
                                         format!(
                                             "balance/{}/{}",
@@ -626,11 +699,13 @@ mod tests {
                                 }
                                 if let Some(vault) = vault {
                                     let value = storage(
+                                        provider,
                                         token,
                                         slot(
                                             board_provider,
                                             slot(vault, U256::from(*allowance_slot)),
                                         ),
+                                        block,
                                     )
                                     .await;
                                     attributes.push((
@@ -659,7 +734,7 @@ mod tests {
         }
 
         #[tokio::test]
-        // `BLOCKS` is a hand-edited constant, empty until the generation is deployed.
+        // `BLOCKS` is a hand-edited constant, empty until a generation is deployed.
         #[allow(clippy::const_is_empty)]
         async fn matches_executor_boards_and_venue_quotes_on_base_sepolia() {
             assert!(
@@ -670,37 +745,40 @@ mod tests {
             );
             let url = env::var("BASE_SEPOLIA_RPC_URL").expect("BASE_SEPOLIA_RPC_URL");
             let provider = ProviderBuilder::new().connect_http(url.parse().unwrap());
+            let provider = &provider;
             let venue = Address::from_str(deployment::VENUE).unwrap();
             let executor = Address::from_str(deployment::EXECUTOR).unwrap();
             let tokens = tokens();
 
-            let mut boards = 0;
-            let mut compared = 0;
-            let mut live = 0;
+            let (mut boards, mut live_boards) = (0, 0);
+            let (mut quotes, mut live_quotes, mut fillables, mut limits) = (0, 0, 0, 0);
             for &block in deployment::BLOCKS {
-                let (state, makers) = state_at(&provider, block, &tokens).await;
+                let (state, makers) = state_at(provider, block, &tokens).await;
                 for &(i, o, sizes) in deployment::QUOTES {
                     let (tin, tout) = (&tokens[i].0, &tokens[o].0);
+                    let route = format!("block {block} {} -> {}", tin.symbol, tout.symbol);
 
                     // Every maker's board as the venue reads it.
                     let (_, views) = state
                         .board_views(&address_of(tin).0 .0, &address_of(tout).0 .0)
                         .unwrap();
-                    for (mm, view) in makers.iter().zip(&views) {
+                    let chain_boards = join_all(makers.iter().map(|mm| {
                         let data = boardCall {
                             mm: *mm,
                             tokenIn: address_of(tin),
                             tokenOut: address_of(tout),
                         }
                         .abi_encode();
-                        let chain = boardCall::abi_decode_returns(
-                            &call(&provider, executor, data, block)
-                                .await
-                                .unwrap(),
-                        )
-                        .unwrap();
-                        let context =
-                            format!("block {block} {mm} {} -> {}", tin.symbol, tout.symbol);
+                        call(provider, executor, data, block)
+                    }))
+                    .await;
+                    for ((mm, view), chain) in makers
+                        .iter()
+                        .zip(&views)
+                        .zip(chain_boards)
+                    {
+                        let chain = boardCall::abi_decode_returns(&chain.unwrap()).unwrap();
+                        let context = format!("{route} board of {mm}");
                         let level_sizes: Vec<U256> = view
                             .levels
                             .iter()
@@ -716,36 +794,82 @@ mod tests {
                         assert_eq!(view.filled, chain.filled, "{context} filled");
                         assert_eq!(view.remaining, chain.remaining, "{context} remaining");
                         boards += 1;
+                        live_boards += usize::from(!chain.remaining.is_zero());
                     }
 
-                    for &size in sizes {
+                    // `quote` and `quoteFillable` for every size.
+                    let mut amounts: Vec<U256> = sizes
+                        .iter()
+                        .map(|size| U256::from(*size))
+                        .collect();
+                    amounts.push(U256::MAX);
+                    let chain_quotes = join_all(amounts.iter().map(|amount| {
                         let data = quoteCall {
                             tokenIn: address_of(tin),
                             tokenOut: address_of(tout),
-                            amountIn: U256::from(size),
+                            amountIn: *amount,
                         }
                         .abi_encode();
-                        let chain = call(&provider, venue, data, block)
-                            .await
-                            .map(|out| quoteCall::abi_decode_returns(&out).unwrap());
-                        let sim = state
-                            .get_amount_out(BigUint::from(size), tin, tout)
+                        call(provider, venue, data, block)
+                    }))
+                    .await;
+                    let chain_fillables = join_all(amounts.iter().map(|amount| {
+                        let data = quoteFillableCall {
+                            tokenIn: address_of(tin),
+                            tokenOut: address_of(tout),
+                            amountIn: *amount,
+                        }
+                        .abi_encode();
+                        call(provider, venue, data, block)
+                    }))
+                    .await;
+                    for ((amount, chain_quote), chain_fillable) in amounts
+                        .iter()
+                        .zip(chain_quotes)
+                        .zip(chain_fillables)
+                    {
+                        let chain_fillable =
+                            quoteFillableCall::abi_decode_returns(&chain_fillable.unwrap())
+                                .unwrap();
+                        let chain_fillable =
+                            (chain_fillable.fillableAmountIn, chain_fillable.amountOut);
+                        if *amount == U256::MAX {
+                            // Tycho's limits are the venue's whole fillable size.
+                            let (limit_in, limit_out) = state
+                                .get_limits(tin.address.clone(), tout.address.clone())
+                                .unwrap();
+                            assert_eq!(
+                                (biguint_to_u256(&limit_in), biguint_to_u256(&limit_out)),
+                                chain_fillable,
+                                "{route} limits"
+                            );
+                            limits += 1;
+                            continue;
+                        }
+                        let chain_quote =
+                            chain_quote.map(|out| quoteCall::abi_decode_returns(&out).unwrap());
+                        let sim_quote = state
+                            .get_amount_out(u256_to_biguint(*amount), tin, tout)
                             .ok()
-                            .map(|result| {
-                                crate::evm::protocol::u256_num::biguint_to_u256(&result.amount)
-                            });
+                            .map(|result| biguint_to_u256(&result.amount));
+                        assert_eq!(sim_quote, chain_quote, "{route} quote of {amount}");
                         assert_eq!(
-                            sim, chain,
-                            "block {block} {} -> {} size {size}",
-                            tin.symbol, tout.symbol
+                            quote_fillable(&state, tin, tout, *amount),
+                            chain_fillable,
+                            "{route} quoteFillable of {amount}"
                         );
-                        compared += 1;
-                        live += usize::from(chain.is_some());
+                        quotes += 1;
+                        fillables += 1;
+                        live_quotes += usize::from(chain_quote.is_some());
                     }
                 }
             }
-            println!("compared {boards} boards and {compared} quotes, {live} live");
-            assert!(live >= compared / 2, "only {live} of {compared} quotes were live");
+            println!(
+                "{} blocks: {boards} boards ({live_boards} live), {quotes} quotes \
+                 ({live_quotes} live), {fillables} quoteFillable, {limits} limits, all equal",
+                deployment::BLOCKS.len()
+            );
+            assert!(live_boards > 0 && live_quotes > 0, "nothing was live at the pinned blocks");
         }
     }
 }
