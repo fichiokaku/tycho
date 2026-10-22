@@ -155,7 +155,7 @@ impl BiconomyState {
     }
 
     /// Every maker's board for a direction, as the venue reads them.
-    fn board_views(
+    pub(super) fn board_views(
         &self,
         token_in: &Address,
         token_out: &Address,
@@ -425,8 +425,8 @@ impl ProtocolSim for BiconomyState {
         other.as_any().downcast_ref::<Self>() == Some(self)
     }
 
-    /// Prices move with the execution block's timestamp (anchor drift, widening, expiry) and
-    /// number (premium window, block cap), so every new block can change quotes.
+    /// Prices move with the execution block's number (anchor drift, widening, premium window,
+    /// per-block budget) and timestamp (expiry), so every new block can change quotes.
     fn apply_block(&mut self, block: &BlockContext) -> bool {
         let next = BlockEnvState { number: block.number(), timestamp: block.timestamp() };
         if next == self.block {

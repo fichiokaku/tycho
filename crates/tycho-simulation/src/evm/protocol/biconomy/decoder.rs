@@ -5,7 +5,7 @@
 //! | attribute                                | value                                          |
 //! |------------------------------------------|------------------------------------------------|
 //! | `fee_bps`                                | venue storage slot 0 (`feeBps` is its low 16 bits) |
-//! | `maker_count`                            | venue storage slot 1 (`makerList.length`)      |
+//! | `maker_count`                            | venue storage slot 2 (`makerList.length`)      |
 //! | `maker/{i}`                              | `makerList[i]`                                 |
 //! | `board/{mm}/{tokenIn}/{tokenOut}/{slot}` | executor storage word `slot` (0..24) of board  |
 //! | `anchor/{mm}/{token0}/{token1}`          | executor anchor word for the sorted pair       |
