@@ -26,15 +26,24 @@ use super::{
 };
 use crate::evm::protocol::u256_num::{biguint_to_u256, u256_to_biguint};
 
-/// Gas of a venue swap. The venue reads every registered maker's board (a live board loads its
-/// levels and calls the provider's `signer` and `available`), then fills each maker the order
-/// lands on. Measured on Base at block 52549180 (5 makers, 1 live): `quote` 166k to 177k,
-/// `board()` 34k dark and 79k live, all including the 21k transaction base; 7 swaps with one
-/// fill each used 328k to 355k.
-const BASE_GAS: u64 = 40_000;
-const GAS_PER_DARK_BOARD: u64 = 15_000;
-const GAS_PER_LIVE_BOARD: u64 = 60_000;
-const GAS_PER_FILL: u64 = 130_000;
+/// Gas of a venue swap, net of refunds and without the transaction's intrinsic cost. The venue
+/// reads every registered maker's board (a live board loads its levels, its block meter and
+/// controls, and calls the provider's `signer` and `available`), then sends each maker's share to
+/// the executor and fills it.
+///
+/// Measured from opcode traces of two venue swaps on the v1.0.0-rc.1 deployment on Base Sepolia
+/// (7 makers, 2 live, 18-decimal mock tokens, fixture providers):
+/// 0x46d9d6a0425a45b2df374d1811e052b13a63eafe3844662df6ba20b4f2b8214e (one fill, 268,153) and
+/// 0xebba81364f22d4d10748dc050f5176b5e926f47ad892a3fbeba1d41a2664416b (two fills, 368,333). Each
+/// dark board read costs 16.1k and each live one 45.0k to 46.9k. A fill costs 66.1k after the 39.8k
+/// it refunds (the executor's input balance and its allowance to the provider return to zero).
+/// The two-fill swap paid more per fill, 97.1k and 70.5k, because they were both boards' first
+/// fills (the block meter is written from zero) and the receiver's first tokenOut. Real tokens and
+/// vault-backed providers make fills dearer than these mocks.
+const BASE_GAS: u64 = 30_000;
+const GAS_PER_DARK_BOARD: u64 = 16_000;
+const GAS_PER_LIVE_BOARD: u64 = 46_000;
+const GAS_PER_FILL: u64 = 66_000;
 
 /// How a provider's `available(token)` is computed, from its indexed config.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
