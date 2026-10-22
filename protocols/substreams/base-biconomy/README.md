@@ -6,11 +6,11 @@ makers keep in the PropAMM executor.
 
 | | Base |
 |---|---|
-| Venue (`PropAMMVenue`) | `0x0000009E5F98cDB4dd1E1d2E15B220217c88B3b8` |
-| Executor (`PropAMMExecutor`) | `0x0000006f9bBA066e4efda2e0CAbE4FF8cf9030aC` |
+| Venue (`PropAMMVenue`) | next generation, not deployed yet |
+| Executor (`PropAMMExecutor`) | next generation, not deployed yet |
 | Tokens | WETH `0x4200000000000000000000000000000000000006`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, cbBTC `0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf` |
-| Executor deployed | block 52547671 |
-| Venue deployed | block 52547680 |
+| Executor deployed | not deployed yet |
+| Venue deployed | not deployed yet |
 
 ## Component
 
@@ -31,7 +31,7 @@ value comes from storage changes or from the package params, so it runs on Flash
 | `anchor/{mm}/{token0}/{token1}` | executor storage word of `anchors[mm][token0][token1]` |
 | `paused/{mm}` | executor storage word of `makerPaused[mm]` |
 | `fee_bps` | venue storage slot 0 (`feeBps` is its low 16 bits) |
-| `maker_count`, `maker/{i}` | venue `makerList` length (slot 1) and elements |
+| `maker_count`, `maker/{i}` | venue `makerList` length (slot 2) and elements |
 | `provider/{provider}` | provider config from params: kind, signer and vault |
 | `balance/{token}/{holder}` | the token's `balanceOf` storage word for a provider or vault |
 | `allowance/{token}/{owner}/{spender}` | the token's `allowance` storage word, vault to provider |
@@ -39,7 +39,8 @@ value comes from storage changes or from the package params, so it runs on Flash
 Board, anchor and pause words come from the transaction's storage changes. Every write to them
 comes with an executor event naming the maker and pair (`LadderCommitted`, `OffsetsCommitted`,
 `AnchorCommitted`, `ControlsCommitted`, `MMFillExecuted`, `MakerPaused`), which is how a
-storage slot is matched to its board.
+storage slot is matched to its board. Every fill writes the board's block meter, which the
+per-block budget reads across depth versions.
 
 ## Provider inventory and signer
 
@@ -64,6 +65,7 @@ package.
 
 ## Update timing
 
-Updates arrive per flashblock on Tycho's Base stream. Prices also move with time inside a board
-(anchor drift, quote-age widening, premium window, expiry), which the simulation applies from
-the execution block's number and timestamp without a state update.
+Updates arrive per flashblock on Tycho's Base stream. Prices also move from block to block
+inside a board: drift and widening grow with the board's age in blocks, the premium window and
+the per-block budget count blocks, and boards and anchors expire by timestamp. The simulation
+applies all of it from the execution block's number and timestamp without a state update.

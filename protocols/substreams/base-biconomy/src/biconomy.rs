@@ -7,8 +7,8 @@
 //! pair, which is how a storage change is matched to the board it belongs to.
 //!
 //! The venue keeps `feeBps` in the low 16 bits of slot 0 and `makerList` as a dynamic array at
-//! slot 1. Provider inventory comes from the configured tokens' balance and allowance mappings.
-//! Nothing is read over RPC.
+//! slot 2 (slot 1 is the `selfReporting` mapping). Provider inventory comes from the configured
+//! tokens' balance and allowance mappings. Nothing is read over RPC.
 
 use tiny_keccak::{Hasher, Keccak};
 use tycho_substreams::prelude as tycho;
@@ -25,7 +25,7 @@ const BOARDS_SLOT: u8 = 0;
 const ANCHORS_SLOT: u8 = 1;
 const PAUSED_SLOT: u8 = 2;
 const VENUE_FEE_SLOT: u8 = 0;
-const VENUE_MAKERS_SLOT: u8 = 1;
+const VENUE_MAKERS_SLOT: u8 = 2;
 
 pub mod attrs {
     pub const FEE_BPS: &str = "fee_bps";
@@ -273,13 +273,46 @@ mod tests {
     fn venue_maker_slots_start_at_the_array_data() {
         let slots = venue_slots();
         assert_eq!(slots[0], (root(0), attrs::FEE_BPS.to_owned()));
-        assert_eq!(slots[1], (root(1), attrs::MAKER_COUNT.to_owned()));
-        // keccak(uint256(1)) is where `makerList` elements start.
+        assert_eq!(slots[1], (root(2), attrs::MAKER_COUNT.to_owned()));
+        // keccak(uint256(2)) is where `makerList` elements start.
         assert_eq!(
             hex::encode(slots[2].0),
-            "b10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6"
+            "405787fa12a823e0f2b7631cc41b3ba8828b3321ca811111fa75cd3aa3bb5ace"
         );
         assert_eq!(slots[3].1, "maker/1");
+    }
+
+    #[test]
+    fn topics_match_the_executor_events() {
+        // `forge inspect PropAMMExecutor events` on propamm-contracts b97ac8d.
+        for (signature, expected) in [
+            (
+                topics::LADDER_COMMITTED,
+                "7c9255334578759e3691eef632f629aac4baaf1a5ea5c250d40b4cfde30fe753",
+            ),
+            (
+                topics::OFFSETS_COMMITTED,
+                "a3b0243637f5a91e0cb80bae3000f8a1156364cefbd0064ee621b266092598c3",
+            ),
+            (
+                topics::ANCHOR_COMMITTED,
+                "5f3fa3067c2d3f65ae9df1f8f69859d3de926cd813ca4842286871c7d4a2a06d",
+            ),
+            (
+                topics::CONTROLS_COMMITTED,
+                "69e8e8fb513d0e266a4625b592c740340ff2b78653cdc0ed28c76f82187cb04c",
+            ),
+            (
+                topics::MM_FILL_EXECUTED,
+                "0d885e383bb9ad86c7811413207f8eabfcba2be4399cea97266e37996d46d062",
+            ),
+            (
+                topics::MAKER_PAUSED,
+                "834d836e17092c5295a41295522d387774b34ac5e97e3c084cc2e150d772635f",
+            ),
+        ] {
+            assert_eq!(hex::encode(topic(signature)), expected, "{signature}");
+        }
     }
 
     #[test]

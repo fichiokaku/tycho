@@ -20,7 +20,8 @@ binaries:
 modules:
   - name: map_protocol_components
     kind: map
-    initialBlock: 52547671
+    # The executor's deployment block (next generation: not deployed yet).
+    initialBlock: &initial_block 0
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
@@ -29,7 +30,7 @@ modules:
 
   - name: store_protocol_components
     kind: store
-    initialBlock: 52547671
+    initialBlock: *initial_block
     updatePolicy: set_if_not_exists
     valueType: proto:tycho.evm.v1.ProtocolComponent
     inputs:
@@ -37,7 +38,7 @@ modules:
 
   - name: map_protocol_changes
     kind: map
-    initialBlock: 52547671
+    initialBlock: *initial_block
     inputs:
       - params: string
       - source: sf.ethereum.type.v2.Block
@@ -47,7 +48,10 @@ modules:
       type: proto:tycho.evm.v1.BlockChanges
 
 params:
-  map_protocol_components: "venue=0x0000009E5F98cDB4dd1E1d2E15B220217c88B3b8&executor=0x0000006f9bBA066e4efda2e0CAbE4FF8cf9030aC&bootstrap_block=52547680&tokens=0x4200000000000000000000000000000000000006:3:4,0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:9:10,0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf:9:10&providers=0x20617e39EeEBF030282feEe1835A8ee5B80c4156:balance:0x72A2df03AeeF2A8343f9Fb86bd65193A3008890C,0x25e864B4903Fd3eeBbfD723B905241ff98893595:vault:0x960f1e3181E928210C02a34EE29bf3d354dD2FF5:0x862FfAcd6b13b4734bd8550C720F115F3F31E6AB"
-  map_protocol_changes: "venue=0x0000009E5F98cDB4dd1E1d2E15B220217c88B3b8&executor=0x0000006f9bBA066e4efda2e0CAbE4FF8cf9030aC&bootstrap_block=52547680&tokens=0x4200000000000000000000000000000000000006:3:4,0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:9:10,0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf:9:10&providers=0x20617e39EeEBF030282feEe1835A8ee5B80c4156:balance:0x72A2df03AeeF2A8343f9Fb86bd65193A3008890C,0x25e864B4903Fd3eeBbfD723B905241ff98893595:vault:0x960f1e3181E928210C02a34EE29bf3d354dD2FF5:0x862FfAcd6b13b4734bd8550C720F115F3F31E6AB"
+  # The next generation is not deployed yet. Fill in `venue`, `executor`, `bootstrap_block` (the
+  # venue's deployment block) and `providers` (each maker's provider, redeployed with the
+  # executor) here, and the executor's deployment block in `initial_block` above.
+  map_protocol_components: &biconomy_params "venue=0x0000000000000000000000000000000000000000&executor=0x0000000000000000000000000000000000000000&bootstrap_block=0&tokens=0x4200000000000000000000000000000000000006:3:4,0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913:9:10,0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf:9:10&providers="
+  map_protocol_changes: *biconomy_params
 
 network: base
