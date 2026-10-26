@@ -2,10 +2,6 @@
 //! boards makers store in the PropAMM executor. The state is the executor's raw board storage,
 //! priced at the execution block the way `PropAMMVenue.quote` prices it.
 
-use tycho_client::feed::BlockHeader;
-
-use crate::evm::decoder::TychoStreamDecoder;
-
 mod decoder;
 mod math;
 pub mod state;
@@ -13,10 +9,6 @@ pub mod state;
 pub use state::BiconomyState;
 
 pub const PROTOCOL_SYSTEM: &str = "biconomy";
-
-pub fn register_biconomy_decoder(decoder: &mut TychoStreamDecoder<BlockHeader>) {
-    decoder.register_decoder::<BiconomyState>(PROTOCOL_SYSTEM);
-}
 
 #[cfg(test)]
 mod tests {
@@ -35,6 +27,7 @@ mod tests {
     use super::{decoder::decode_biconomy_snapshot, state::BiconomyState};
 
     const VENUE: &str = "0x0000009e5f98cdb4dd1e1d2e15b220217c88b3b8";
+    const EXECUTOR: &str = "0x0000006f9bba066e4efda2e0cabe4ff8cf9030ac";
     const MM: &str = "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc";
     const PROVIDER: &str = "0xa5d389cb45ac9e4c41329f8edca523e3ffcd4ca1";
     const WETH: &str = "0x4200000000000000000000000000000000000006";
@@ -44,10 +37,9 @@ mod tests {
         Token::new(&Bytes::from(address), symbol, decimals, 0, &[Some(100_000)], Chain::Base, 100)
     }
 
-    /// A provider config attribute: kind byte, signer, vault.
-    fn provider_config(kind: u8, signer: &str, vault: Option<&str>) -> Bytes {
+    /// A provider config attribute: kind byte, vault.
+    fn provider_config(kind: u8, vault: Option<&str>) -> Bytes {
         let mut out = vec![kind];
-        out.extend(Bytes::from(signer).to_vec());
         out.extend(
             vault
                 .map(|v| Bytes::from(v).to_vec())
@@ -58,6 +50,10 @@ mod tests {
 
     fn word(value: U256) -> Bytes {
         Bytes::from(value.to_be_bytes::<32>().to_vec())
+    }
+
+    fn address_word(address: &str) -> Bytes {
+        word(U256::from_str_radix(&address[2..], 16).unwrap())
     }
 
     /// One maker with a two-level price board WETH -> USDC: 1 WETH at 2000, then 1 more at 1990.
@@ -75,7 +71,9 @@ mod tests {
             (board(0), word(header)),
             (board(2), word(level(1_000_000_000_000_000_000, 2_000_000_000))),
             (board(3), word(level(2_000_000_000_000_000_000, 1_990_000_000))),
-            (format!("provider/{PROVIDER}"), provider_config(0, MM, None)),
+            (format!("provider/{PROVIDER}"), provider_config(0, None)),
+            (format!("signer/{PROVIDER}"), address_word(MM)),
+            (format!("approved_executor/{PROVIDER}"), address_word(EXECUTOR)),
             (format!("balance/{USDC}/{PROVIDER}"), word(U256::from(5_000_000_000u64))),
         ]);
         ComponentWithState {
@@ -89,7 +87,10 @@ mod tests {
                 id: VENUE.to_owned(),
                 protocol_system: "biconomy".to_owned(),
                 tokens: vec![Bytes::from(WETH), Bytes::from(USDC)],
-                static_attributes: HashMap::from([("pamm_address".to_owned(), Bytes::from(VENUE))]),
+                static_attributes: HashMap::from([
+                    ("pamm_address".to_owned(), Bytes::from(VENUE)),
+                    ("executor".to_owned(), Bytes::from(EXECUTOR)),
+                ]),
                 ..Default::default()
             }
             .into(),
@@ -176,27 +177,105 @@ mod tests {
             .is_err());
     }
 
-    #[test]
-    fn board_is_dark_when_the_provider_names_another_signer() {
+    /// Applies `updated` and checks the board goes dark, then comes back once `restored`.
+    fn assert_dark_until_restored(updated: Vec<(String, Bytes)>, restored: Vec<(String, Bytes)>) {
         let mut state = state();
         let weth = token(WETH, "WETH", 18);
         let usdc = token(USDC, "USDC", 6);
-        let other = "0x0000000000000000000000000000000000000001";
+        // 0.001 WETH, 2 USDC at the first level.
+        let one = BigUint::from(1_000_000_000_000_000u64);
+        assert!(state
+            .get_amount_out(one.clone(), &weth, &usdc)
+            .is_ok());
 
-        state
-            .delta_transition(
-                delta(
-                    vec![(format!("provider/{PROVIDER}"), provider_config(0, other, None))],
-                    vec![],
-                ),
-                &HashMap::new(),
-                &Balances::default(),
-            )
+        for (attributes, live) in [(updated, false), (restored, true)] {
+            state
+                .delta_transition(delta(attributes, vec![]), &HashMap::new(), &Balances::default())
+                .unwrap();
+            assert_eq!(
+                state
+                    .get_amount_out(one.clone(), &weth, &usdc)
+                    .is_ok(),
+                live
+            );
+        }
+    }
+
+    const OTHER: &str = "0x0000000000000000000000000000000000000001";
+
+    #[test]
+    fn board_is_dark_when_the_provider_names_another_signer() {
+        assert_dark_until_restored(
+            vec![(format!("signer/{PROVIDER}"), address_word(OTHER))],
+            vec![(format!("signer/{PROVIDER}"), address_word(MM))],
+        );
+    }
+
+    #[test]
+    fn board_is_dark_when_the_provider_approves_another_executor() {
+        // The venue still quotes it, but the fill reverts with `NotApprovedExecutor`.
+        assert_dark_until_restored(
+            vec![(format!("approved_executor/{PROVIDER}"), address_word(OTHER))],
+            vec![(format!("approved_executor/{PROVIDER}"), address_word(EXECUTOR))],
+        );
+    }
+
+    #[test]
+    fn vault_provider_has_no_inventory_unless_the_vault_routes_to_it() {
+        let vault = "0x862ffacd6b13b4734bd8550c720f115f3f31e6ab";
+        let vault_provider = vec![
+            (format!("provider/{PROVIDER}"), provider_config(1, Some(vault))),
+            (format!("balance/{USDC}/{vault}"), word(U256::from(5_000_000_000u64))),
+            (format!("allowance/{USDC}/{vault}/{PROVIDER}"), word(U256::MAX)),
+            (format!("router_count/{vault}"), word(U256::from(1u8))),
+        ];
+        let routed = |router: &str| {
+            let mut attributes = vault_provider.clone();
+            attributes.push((format!("router/{vault}"), address_word(router)));
+            attributes
+        };
+
+        assert_dark_until_restored(routed(OTHER), routed(PROVIDER));
+        // An empty router array: `router()` is zero even with a stale first element.
+        let mut emptied = routed(PROVIDER);
+        emptied.push((format!("router_count/{vault}"), word(U256::ZERO)));
+        assert_dark_until_restored(
+            emptied,
+            vec![(format!("router_count/{vault}"), word(U256::from(1u8)))],
+        );
+    }
+
+    #[test]
+    fn get_limits_are_the_largest_size_the_venue_fills() {
+        let state = state();
+        let weth = token(WETH, "WETH", 18);
+        let usdc = token(USDC, "USDC", 6);
+
+        let (limit_in, limit_out) = state
+            .get_limits(Bytes::from(WETH), Bytes::from(USDC))
             .unwrap();
 
+        // Two levels of 1 WETH each, both within the 5000 USDC of inventory.
+        assert_eq!(limit_in, BigUint::from(2_000_000_000_000_000_000u64));
+        let at_limit = state
+            .get_amount_out(limit_in.clone(), &weth, &usdc)
+            .unwrap();
+        assert_eq!(at_limit.amount, limit_out);
         assert!(state
-            .get_amount_out(BigUint::from(1_000u64), &weth, &usdc)
+            .get_amount_out(limit_in + 1u8, &weth, &usdc)
             .is_err());
+        // Every size up to the limit fills, and output grows with input.
+        let mut previous = BigUint::ZERO;
+        for step in 1u64..=20 {
+            let size = BigUint::from(step) * BigUint::from(100_000_000_000_000_000u64);
+            let out = state
+                .get_amount_out(size, &weth, &usdc)
+                .unwrap()
+                .amount;
+            assert!(out >= previous);
+            previous = out;
+        }
+        assert_eq!(previous, limit_out);
     }
 
     #[test]
@@ -247,13 +326,19 @@ mod tests {
             function quote(address tokenIn, address tokenOut, uint256 amountIn) external view returns (uint256);
             function available(address token) external view returns (uint256);
             function signer() external view returns (address);
+            function approvedExecutor() external view returns (address);
             function vault() external view returns (address);
+            function router() external view returns (address);
         }
 
-        const EXECUTOR: &str = "0x0000006f9bBA066e4efda2e0CAbE4FF8cf9030aC";
         const CBBTC: &str = "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf";
-        // Blocks where a maker's WETH/USDC boards were live in both directions.
-        const BLOCKS: [u64; 3] = [52_549_100, 52_549_180, 52_549_230];
+        // Early blocks with a balance provider's price ladders live in both directions; blocks
+        // across the vault provider's onboarding and maker list rewrites; and blocks with fills
+        // against the vault provider's boards.
+        const BLOCKS: [u64; 13] = [
+            52_549_100, 52_549_180, 52_549_230, 52_806_929, 52_808_000, 52_809_300, 52_922_000,
+            53_096_813, 53_100_992, 53_103_396, 53_108_702, 53_112_973, 53_114_528,
+        ];
 
         fn slot(key: Address, base: U256) -> U256 {
             let mut buf = [0u8; 64];
@@ -313,6 +398,7 @@ mod tests {
             };
 
             let mut state = BiconomyState {
+                executor: executor.0 .0,
                 block: BlockEnvState { number: block, timestamp: header.timestamp },
                 ..Default::default()
             };
@@ -380,6 +466,15 @@ mod tests {
                                     .await
                                     .and_then(|out| signerCall::abi_decode_returns(&out).ok())
                                     .unwrap_or_default();
+                            let approved_executor = call(
+                                provider,
+                                board_provider,
+                                approvedExecutorCall {}.abi_encode(),
+                                block,
+                            )
+                            .await
+                            .and_then(|out| approvedExecutorCall::abi_decode_returns(&out).ok())
+                            .unwrap_or_default();
                             let vault =
                                 call(provider, board_provider, vaultCall {}.abi_encode(), block)
                                     .await
@@ -400,9 +495,33 @@ mod tests {
                                 None => 0,
                             };
                             let mut config = vec![kind];
-                            config.extend(signer.0 .0);
                             config.extend(vault.unwrap_or_default().0 .0);
                             attributes.push((key, Bytes::from(config)));
+                            let provider_key = hex_address(&board_provider.0 .0);
+                            attributes.push((
+                                format!("signer/{provider_key}"),
+                                Bytes::from(signer.into_word().to_vec()),
+                            ));
+                            attributes.push((
+                                format!("approved_executor/{provider_key}"),
+                                Bytes::from(approved_executor.into_word().to_vec()),
+                            ));
+                            if let Some(vault) = vault {
+                                let router =
+                                    call(provider, vault, routerCall {}.abi_encode(), block)
+                                        .await
+                                        .and_then(|out| routerCall::abi_decode_returns(&out).ok())
+                                        .unwrap_or_default();
+                                let vault_key = hex_address(&vault.0 .0);
+                                attributes.push((
+                                    format!("router_count/{vault_key}"),
+                                    word(U256::from(u8::from(!router.is_zero()))),
+                                ));
+                                attributes.push((
+                                    format!("router/{vault_key}"),
+                                    Bytes::from(router.into_word().to_vec()),
+                                ));
+                            }
                             for token in tokens {
                                 let (balance_slot, allowance_slot) = token_slots(*token);
                                 let holder = vault.unwrap_or(board_provider);

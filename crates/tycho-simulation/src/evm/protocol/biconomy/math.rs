@@ -374,8 +374,9 @@ pub struct BoardInputs<'a> {
     pub board: &'a Board,
     pub anchor: U256,
     pub paused: bool,
-    /// Whether the board's provider names the maker as its `signer()`.
-    pub signer_matches: bool,
+    /// Whether the board's provider names the maker as its `signer()` and approves the
+    /// executor.
+    pub provider_serves: bool,
     /// `provider.available(tokenOut)`; `None` when the indexer has not reported it.
     pub available_out: Option<U256>,
 }
@@ -390,7 +391,7 @@ pub fn board_view(
     let board = inputs.board;
     let av = anchor_view(board, token_in, token_out, inputs.anchor);
     let filled = board.filled;
-    if inputs.paused || !is_live(board, &av, env) || !inputs.signer_matches {
+    if inputs.paused || !is_live(board, &av, env) || !inputs.provider_serves {
         return Ok(BoardView { levels: Vec::new(), filled, remaining: U256::ZERO });
     }
 
@@ -558,7 +559,7 @@ mod tests {
             board,
             anchor: U256::ZERO,
             paused: false,
-            signer_matches: true,
+            provider_serves: true,
             available_out: available,
         };
         board_view(&inputs, &[1; 20], &[2; 20], &env()).unwrap()
@@ -658,7 +659,7 @@ mod tests {
             board: &board,
             anchor,
             paused: false,
-            signer_matches: true,
+            provider_serves: true,
             available_out: Some(U256::MAX),
         };
 

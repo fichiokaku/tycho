@@ -50,8 +50,6 @@ pub enum ProviderKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
-    /// The provider's `signer()`. A board is dark unless it is the maker.
-    pub signer: Address,
 }
 
 /// One Biconomy PropAMM venue: every registered maker's boards for every pair it serves, as the
@@ -60,6 +58,8 @@ pub struct ProviderConfig {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BiconomyState {
     pub venue: Address,
+    /// The executor the venue fills through. A provider must approve it.
+    pub executor: Address,
     pub fee_bps: u16,
     /// `makerList.length`; entries in `maker_slots` beyond it are ignored.
     pub maker_count: u64,
@@ -72,6 +72,16 @@ pub struct BiconomyState {
     pub paused: BTreeSet<Address>,
     /// Configured providers, by address. A provider without a config has no inventory.
     pub providers: BTreeMap<String, ProviderConfig>,
+    /// Each provider's `signer()`, by provider. A board is dark unless it is the maker.
+    pub signers: BTreeMap<String, Address>,
+    /// Each provider's `approvedExecutor`, by provider. A board is dark unless it is the
+    /// executor: the venue would still quote it, but the fill reverts.
+    pub approved_executors: BTreeMap<String, Address>,
+    /// Each vault's router array length, by vault. `router()` is zero while it is empty.
+    pub router_counts: BTreeMap<String, U256>,
+    /// Each vault's first router, by vault. A vault provider has no inventory unless the
+    /// vault's `router()` is the provider.
+    pub routers: BTreeMap<String, Address>,
     /// Raw `balanceOf` words, by `pair_key(token, holder)`.
     pub balances: BTreeMap<String, U256>,
     /// `allowance` values, by `allowance_key(token, owner, spender)`.
@@ -127,11 +137,34 @@ impl BiconomyState {
             .get(&hex_address(provider))?;
         Some(match config.kind {
             ProviderKind::Balance => self.balance(token, provider),
-            ProviderKind::Vault(vault) => self
+            ProviderKind::Vault(vault) if self.router(&vault) == Some(*provider) => self
                 .balance(token, &vault)
                 .min(self.allowance(token, &vault, provider)),
+            ProviderKind::Vault(_) => U256::ZERO,
             ProviderKind::Unbounded => U256::MAX,
         })
+    }
+
+    /// The vault's `router()`: the first element of its router array, `None` while empty.
+    fn router(&self, vault: &Address) -> Option<Address> {
+        let key = hex_address(vault);
+        if self
+            .router_counts
+            .get(&key)
+            .is_none_or(|count| count.is_zero())
+        {
+            return None;
+        }
+        self.routers.get(&key).copied()
+    }
+
+    /// Whether `provider` fills `mm`'s boards through this venue's executor: it names `mm` as
+    /// its signer and approves the executor.
+    fn serves(&self, provider: &Address, mm: &Address) -> bool {
+        let key = hex_address(provider);
+        self.providers.contains_key(&key) &&
+            self.signers.get(&key) == Some(mm) &&
+            self.approved_executors.get(&key) == Some(&self.executor)
     }
 
     fn env(&self) -> BlockEnv {
@@ -170,10 +203,7 @@ impl BiconomyState {
                 board: &board,
                 anchor: self.anchor(mm, token_in, token_out),
                 paused: self.paused.contains(mm),
-                signer_matches: self
-                    .providers
-                    .get(&hex_address(&board.provider))
-                    .is_some_and(|config| config.signer == *mm),
+                provider_serves: self.serves(&board.provider, mm),
                 available_out: self.available(&board.provider, token_out),
             };
             views.push(board_view(&inputs, token_in, token_out, &env)?);

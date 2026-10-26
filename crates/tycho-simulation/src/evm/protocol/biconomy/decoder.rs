@@ -10,9 +10,14 @@
 //! | `board/{mm}/{tokenIn}/{tokenOut}/{slot}` | executor storage word `slot` (0..24) of board  |
 //! | `anchor/{mm}/{token0}/{token1}`          | executor anchor word for the sorted pair       |
 //! | `paused/{mm}`                            | 1 when the maker paused itself                 |
-//! | `provider/{provider}`                    | kind byte (0 balance, 1 vault, 2 unbounded), signer, vault |
+//! | `provider/{provider}`                    | kind byte (0 balance, 1 vault, 2 unbounded), vault |
+//! | `signer/{provider}`                      | the provider's `signer()` word                 |
+//! | `approved_executor/{provider}`           | the provider's `approvedExecutor` word         |
+//! | `router_count/{vault}`, `router/{vault}` | the vault's router array length and first element (`router()`) |
 //! | `balance/{token}/{holder}`               | the token's `balanceOf` storage word           |
 //! | `allowance/{token}/{owner}/{spender}`    | the token's `allowance` storage word           |
+//!
+//! Static attributes: `pamm_address` (the venue) and `executor`.
 
 use std::collections::HashMap;
 
@@ -39,7 +44,12 @@ pub mod attrs {
     pub const PROVIDER: &str = "provider";
     pub const BALANCE: &str = "balance";
     pub const ALLOWANCE: &str = "allowance";
+    pub const SIGNER: &str = "signer";
+    pub const APPROVED_EXECUTOR: &str = "approved_executor";
+    pub const ROUTER_COUNT: &str = "router_count";
+    pub const ROUTER: &str = "router";
     pub const PAMM_ADDRESS: &str = "pamm_address";
+    pub const EXECUTOR: &str = "executor";
 }
 
 /// Seconds between Base blocks, to project a snapshot's header to the block a quote lands in
@@ -86,9 +96,9 @@ fn word_address(word: U256) -> Address {
         .expect("20 bytes")
 }
 
-/// A provider config: kind byte, signer, then the vault for a vault provider.
+/// A provider config: kind byte, then the vault for a vault provider.
 fn decode_provider(value: &Bytes) -> Result<ProviderConfig, InvalidSnapshotError> {
-    if value.len() != 41 {
+    if value.len() != 21 {
         return Err(InvalidSnapshotError::ValueError(format!(
             "provider config of {} bytes",
             value.len()
@@ -101,13 +111,13 @@ fn decode_provider(value: &Bytes) -> Result<ProviderConfig, InvalidSnapshotError
     };
     let kind = match value[0] {
         0 => ProviderKind::Balance,
-        1 => ProviderKind::Vault(address(21..41)),
+        1 => ProviderKind::Vault(address(1..21)),
         2 => ProviderKind::Unbounded,
         other => {
             return Err(InvalidSnapshotError::ValueError(format!("provider kind {other}")));
         }
     };
-    Ok(ProviderConfig { kind, signer: address(1..21) })
+    Ok(ProviderConfig { kind })
 }
 
 pub enum AttributeChange<'a> {
@@ -195,6 +205,30 @@ pub fn apply_attributes<'a>(
                         .insert(hex_address(&provider), decode_provider(&value)?);
                 }
             }
+            [attrs::SIGNER, provider] => {
+                let key = hex_address(&parse_address(provider)?);
+                state
+                    .signers
+                    .insert(key, word_address(word(&value)?));
+            }
+            [attrs::APPROVED_EXECUTOR, provider] => {
+                let key = hex_address(&parse_address(provider)?);
+                state
+                    .approved_executors
+                    .insert(key, word_address(word(&value)?));
+            }
+            [attrs::ROUTER_COUNT, vault] => {
+                let key = hex_address(&parse_address(vault)?);
+                state
+                    .router_counts
+                    .insert(key, word(&value)?);
+            }
+            [attrs::ROUTER, vault] => {
+                let key = hex_address(&parse_address(vault)?);
+                state
+                    .routers
+                    .insert(key, word_address(word(&value)?));
+            }
             [attrs::BALANCE, token, holder] => {
                 let key = pair_key(&parse_address(token)?, &parse_address(holder)?);
                 state
@@ -221,15 +255,20 @@ pub fn decode_biconomy_snapshot(
     snapshot: &ComponentWithState,
     header: &BlockHeader,
 ) -> Result<BiconomyState, InvalidSnapshotError> {
-    let venue = snapshot
-        .component
-        .static_attributes
-        .get(attrs::PAMM_ADDRESS)
-        .ok_or_else(|| InvalidSnapshotError::MissingAttribute(attrs::PAMM_ADDRESS.to_owned()))?;
+    let static_address = |name: &str| -> Result<Address, InvalidSnapshotError> {
+        let value = snapshot
+            .component
+            .static_attributes
+            .get(name)
+            .ok_or_else(|| InvalidSnapshotError::MissingAttribute(name.to_owned()))?;
+        value
+            .as_ref()
+            .try_into()
+            .map_err(|_| InvalidSnapshotError::ValueError(format!("invalid {name} {value}")))
+    };
     let mut state = BiconomyState {
-        venue: venue.as_ref().try_into().map_err(|_| {
-            InvalidSnapshotError::ValueError(format!("invalid {} {venue}", attrs::PAMM_ADDRESS))
-        })?,
+        venue: static_address(attrs::PAMM_ADDRESS)?,
+        executor: static_address(attrs::EXECUTOR)?,
         block: BlockEnvState {
             number: header.number + 1,
             timestamp: header.timestamp + BLOCK_TIME_SECS,
