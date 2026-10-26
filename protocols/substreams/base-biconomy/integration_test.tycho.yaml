@@ -3,13 +3,25 @@ protocol_system: "biconomy"
 protocol_type_names:
   - "biconomy_venue"
 module_name: "map_protocol_changes"
-# The venue holds no inventory: makers' providers pay fills, so the component has no token
-# balances to check.
+# The venue holds no inventory: its component balances are the providers' inventory, which no
+# account balance of the venue matches.
 skip_balance_check: true
 tests:
   - name: test_venue_component
     start_block: 52547671
     stop_block: 52549230
+    expected_components:
+      - id: "0x0000009e5f98cdb4dd1e1d2e15b220217c88b3b8"
+        tokens:
+          - "0x4200000000000000000000000000000000000006"
+          - "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+          - "0xcbb7c0000ab88b473b1f5afd9ef808440eed33bf"
+        creation_tx: "0x3f3ca25c68af17bb8ca5ed326895186d17a842276efd356d98f56f234cee6cb9"
+  # From creation through the vault provider's onboarding and the maker list rewrites around
+  # 52806929..52809300.
+  - name: test_vault_provider_and_maker_list
+    start_block: 52547671
+    stop_block: 52809300
     expected_components:
       - id: "0x0000009e5f98cdb4dd1e1d2e15b220217c88b3b8"
         tokens:

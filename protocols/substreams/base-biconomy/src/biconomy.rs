@@ -7,8 +7,9 @@
 //! pair, which is how a storage change is matched to the board it belongs to.
 //!
 //! The venue keeps `feeBps` in the low 16 bits of slot 0 and `makerList` as a dynamic array at
-//! slot 1. Provider inventory comes from the configured tokens' balance and allowance mappings.
-//! Nothing is read over RPC.
+//! slot 1. Provider inventory comes from the configured tokens' balance and allowance mappings,
+//! and whether a provider serves the venue from its `signer` and `approvedExecutor` slots and, for
+//! a vault provider, the vault's `router()`. Nothing is read over RPC.
 
 use tiny_keccak::{Hasher, Keccak};
 use tycho_substreams::prelude as tycho;
@@ -47,6 +48,13 @@ fn mapping_slot(key: &Address, base: &Word) -> Word {
     buf[12..32].copy_from_slice(key);
     buf[32..].copy_from_slice(base);
     keccak(&buf)
+}
+
+/// A 20-byte address as the 32-byte storage word holding it.
+pub fn address_word(address: &Address) -> Vec<u8> {
+    let mut word = vec![0u8; 32];
+    word[12..].copy_from_slice(address);
+    word
 }
 
 pub fn root(slot: u8) -> Word {
@@ -92,6 +100,11 @@ pub fn allowance_slot(owner: &Address, spender: &Address, base: u8) -> Word {
     mapping_slot(spender, &mapping_slot(owner, &root(base)))
 }
 
+/// The length slot of a dynamic array at `slot` and the slot of its first element.
+pub fn array_slots(slot: u8) -> (Word, Word) {
+    (root(slot), keccak(&root(slot)))
+}
+
 /// Every venue slot the fee and maker list live in, with its attribute.
 pub fn venue_slots() -> Vec<(Word, String)> {
     let mut slots = vec![
@@ -127,6 +140,22 @@ pub fn maker_attribute(index: u8) -> String {
 
 pub fn provider_attribute(provider: &Address) -> String {
     format!("provider/{}", hex_address(provider))
+}
+
+pub fn signer_attribute(provider: &Address) -> String {
+    format!("signer/{}", hex_address(provider))
+}
+
+pub fn approved_executor_attribute(provider: &Address) -> String {
+    format!("approved_executor/{}", hex_address(provider))
+}
+
+pub fn router_count_attribute(vault: &Address) -> String {
+    format!("router_count/{}", hex_address(vault))
+}
+
+pub fn router_attribute(vault: &Address) -> String {
+    format!("router/{}", hex_address(vault))
 }
 
 pub fn balance_attribute(token: &Address, holder: &Address) -> String {
