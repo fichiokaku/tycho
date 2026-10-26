@@ -26,8 +26,10 @@ pub fn map_protocol_components(
         return Ok(tycho::BlockTransactionProtocolComponents { tx_components: vec![] });
     };
 
-    let component = tycho::ProtocolComponent::at_contract(&config.venue)
-        .with_contracts(&[config.venue, config.executor])
+    // Native component: no contracts. The package emits attributes and balances, never contract
+    // storage, so listing the venue or executor here would make the indexer look for accounts
+    // it never receives and fail at this block.
+    let component = tycho::ProtocolComponent::new(&config.component_id())
         .with_tokens(
             &config
                 .tokens
