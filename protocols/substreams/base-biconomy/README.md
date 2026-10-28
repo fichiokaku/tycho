@@ -48,8 +48,15 @@ storage slot is matched to its board.
 
 Commits on the executor are permissionless, so the package keeps an event only when its maker is
 in the venue's `makerList` at that transaction and both tokens are in the `tokens` param. The
-venue lists a maker before the maker commits, so nothing is lost in the normal flow. A maker that
-commits while unlisted and is listed later has those boards missing until its next commit.
+venue lists a maker before the maker commits, so nothing is lost in the normal flow.
+
+Writes made while a maker is not listed (before its first listing, or between a removal and a
+re-listing) are dropped for good. A later depth commit rewrites the board's header, meter and
+levels, but not its controls (block cap, widening, premium), its pair anchor or the maker's pause
+flag. So a maker that sets controls, moves its anchor or pauses while unlisted is indexed without
+them once listed: the simulation can then quote it with no block cap or widening, or while it is
+paused, and overstate what the venue fills. Biconomy re-lists a removed maker only after it
+recommits controls and anchor and unpauses; otherwise the package needs a resync from 52547671.
 
 `map_state_writes` collects the venue, provider, vault and token writes and `store_state` keeps
 their latest values, which `map_protocol_changes` reads to check the maker list and to compute
@@ -58,10 +65,11 @@ balances at each transaction.
 ## Provider inventory, signer and executor
 
 The executor caps a board's depth at its provider's `available(tokenOut)` and keeps a board dark
-unless the provider's `signer()` is the maker. A provider that approves another executor still
-shows a quote on the venue, but the fill reverts. The simulation keeps a board dark unless the
-provider names the maker as signer and approves `executor`, and computes inventory from the
-provider config in the params and the tracked storage:
+unless the provider's `signer()` is the maker. It does not check `approvedExecutor`: the venue
+still routes to a maker whose provider dropped this executor, and the swap reverts with
+`FillLegFailed`. The simulation does the same: the board stays in the merge, and a quote whose
+plan allocates to it fails, as does `get_limits`. Inventory comes from the provider config in the
+params and the tracked storage:
 
 | kind | `available(token)` |
 |---|---|
@@ -86,7 +94,8 @@ which the simulation masks). Balances and allowances that predate `bootstrap_blo
 `balances` and `allowances` params; none do for the providers configured today.
 
 A provider that is not in the params has no inventory, so its boards stay dark: the package can
-miss a quote but never overstates depth.
+miss a quote there but not overstate depth. The one case where it can overstate is a maker's
+writes while unlisted, above.
 
 ## Adding a provider or a token
 

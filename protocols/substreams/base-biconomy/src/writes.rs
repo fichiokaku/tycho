@@ -18,31 +18,33 @@ use crate::{
 /// Attribute name to its final value in this transaction.
 pub type Writes = BTreeMap<String, Vec<u8>>;
 
-/// The final value of every watched slot this transaction wrote on `address`. A parent call
-/// that writes after its child returns comes before the child in `calls`, so writes are ordered
-/// by their ordinal and the last one wins.
-fn watched_writes(
-    tx: &eth::v2::TransactionTrace,
-    address: &Address,
-    slots: &HashMap<Word, String>,
-    out: &mut Writes,
-) {
-    if slots.is_empty() {
+/// Watched storage slots by contract, each with its attribute.
+pub type Watched = HashMap<Address, HashMap<Word, String>>;
+
+/// The final value of every watched slot this transaction wrote, in one pass over its storage
+/// changes. A parent call that writes after its child returns comes before the child in `calls`,
+/// so writes are ordered by their ordinal and the last one wins.
+fn watched_writes(tx: &eth::v2::TransactionTrace, watched: &Watched, out: &mut Writes) {
+    if watched.is_empty() {
         return;
     }
-    let mut changes: Vec<&eth::v2::StorageChange> = tx
+    let mut changes: Vec<(&eth::v2::StorageChange, &String)> = tx
         .calls
         .iter()
         .filter(|call| !call.state_reverted)
         .flat_map(|call| call.storage_changes.iter())
-        .filter(|change| change.address == address)
+        .filter_map(|change| {
+            let address = <Address>::try_from(change.address.as_slice()).ok()?;
+            let key = <Word>::try_from(change.key.as_slice()).ok()?;
+            watched
+                .get(&address)?
+                .get(&key)
+                .map(|name| (change, name))
+        })
         .collect();
-    changes.sort_by_key(|change| change.ordinal);
-    for change in changes {
-        let Ok(key) = <Word>::try_from(change.key.as_slice()) else { continue };
-        if let Some(name) = slots.get(&key) {
-            out.insert(name.clone(), change.new_value.clone());
-        }
+    changes.sort_by_key(|(change, _)| change.ordinal);
+    for (change, name) in changes {
+        out.insert(name.clone(), change.new_value.clone());
     }
 }
 
@@ -82,61 +84,106 @@ pub fn executor_writes(
     listed: &dyn Fn(&Address) -> bool,
 ) -> Writes {
     let mut out = Writes::new();
-    watched_writes(tx, &config.executor, &executor_slots(tx, config, listed), &mut out);
+    let slots = executor_slots(tx, config, listed);
+    if !slots.is_empty() {
+        watched_writes(tx, &Watched::from([(config.executor, slots)]), &mut out);
+    }
     out
 }
 
-/// Precomputed slot lookups for the venue, the providers and vaults, and the tracked tokens.
+/// Precomputed slot lookups: the venue, providers and vaults, and with them the tracked tokens.
 pub struct Watch {
-    venue: HashMap<Word, String>,
-    providers: Vec<(Address, HashMap<Word, String>)>,
-    tokens: Vec<(Address, HashMap<Word, String>)>,
+    state: Watched,
+    with_tokens: Watched,
 }
 
 impl Watch {
     pub fn new(config: &Config) -> Self {
-        Self {
-            venue: venue_slots().into_iter().collect(),
-            providers: config
-                .provider_state_slots()
-                .into_iter()
-                .map(|(address, slots)| (address, slots.into_iter().collect()))
-                .collect(),
-            tokens: config
-                .tokens
-                .iter()
-                .map(|token| {
-                    (
-                        token.address,
-                        config
-                            .inventory_slots(token)
-                            .into_iter()
-                            .collect(),
-                    )
-                })
-                .collect(),
+        let mut state = Watched::new();
+        state
+            .entry(config.venue)
+            .or_default()
+            .extend(venue_slots());
+        for (address, slots) in config.provider_state_slots() {
+            state
+                .entry(address)
+                .or_default()
+                .extend(slots);
         }
+        let mut with_tokens = state.clone();
+        for token in &config.tokens {
+            with_tokens
+                .entry(token.address)
+                .or_default()
+                .extend(config.inventory_slots(token));
+        }
+        Self { state, with_tokens }
     }
 
     /// Everything this transaction wrote to the venue, provider and vault slots, and with
     /// `tokens` the tracked token storage. Token storage is skipped in the creation block,
     /// whose token state the bootstrap values already describe.
-    pub fn state_writes(
-        &self,
-        tx: &eth::v2::TransactionTrace,
-        config: &Config,
-        tokens: bool,
-    ) -> Writes {
+    pub fn state_writes(&self, tx: &eth::v2::TransactionTrace, tokens: bool) -> Writes {
         let mut out = Writes::new();
-        watched_writes(tx, &config.venue, &self.venue, &mut out);
-        for (address, slots) in &self.providers {
-            watched_writes(tx, address, slots, &mut out);
-        }
-        if tokens {
-            for (token, slots) in &self.tokens {
-                watched_writes(tx, token, slots, &mut out);
-            }
-        }
+        watched_writes(tx, if tokens { &self.with_tokens } else { &self.state }, &mut out);
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn change(address: u8, key: u8, value: u8, ordinal: u64) -> eth::v2::StorageChange {
+        let mut word = [0u8; 32];
+        word[31] = key;
+        eth::v2::StorageChange {
+            address: [address; 20].to_vec(),
+            key: word.to_vec(),
+            new_value: vec![value],
+            ordinal,
+            ..Default::default()
+        }
+    }
+
+    fn slot(key: u8) -> Word {
+        let mut word = [0u8; 32];
+        word[31] = key;
+        word
+    }
+
+    #[test]
+    fn one_pass_keeps_the_last_write_by_ordinal_across_contracts() {
+        // The parent call writes slot 1 after its child returns, so it comes first in `calls`
+        // but has the later ordinal. Contract 3 is not watched.
+        let tx = eth::v2::TransactionTrace {
+            calls: vec![
+                eth::v2::Call {
+                    storage_changes: vec![change(1, 1, 9, 30), change(3, 1, 7, 31)],
+                    ..Default::default()
+                },
+                eth::v2::Call {
+                    storage_changes: vec![change(1, 1, 5, 20), change(2, 4, 6, 21)],
+                    ..Default::default()
+                },
+                eth::v2::Call {
+                    storage_changes: vec![change(2, 4, 8, 40)],
+                    state_reverted: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let watched = Watched::from([
+            ([1u8; 20], HashMap::from([(slot(1), "a".to_owned())])),
+            ([2u8; 20], HashMap::from([(slot(4), "b".to_owned())])),
+        ]);
+        let mut out = Writes::new();
+        watched_writes(&tx, &watched, &mut out);
+
+        assert_eq!(out.get("a"), Some(&vec![9]));
+        // The reverted call's write is ignored.
+        assert_eq!(out.get("b"), Some(&vec![6]));
+        assert_eq!(out.len(), 2);
     }
 }

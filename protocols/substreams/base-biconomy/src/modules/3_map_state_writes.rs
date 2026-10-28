@@ -39,6 +39,15 @@ pub fn map_state_writes(
             .get_last(component_key(&component_id))
             .is_none()
     {
+        // Past `bootstrap_block` without a component: the block had no transaction calling the
+        // venue, or it is below the modules' initial block. Indexing nothing would look healthy.
+        if block.number > config.bootstrap_block {
+            return Err(anyhow::anyhow!(
+                "Biconomy component {component_id} was not created at bootstrap_block {}: \
+                 check that block calls the venue and is not below initialBlock",
+                config.bootstrap_block
+            ));
+        }
         return Ok(tycho::BlockChanges { block: Some((&block).into()), ..Default::default() });
     }
 
@@ -58,7 +67,7 @@ pub fn map_state_writes(
         }
         attributes.extend(
             watch
-                .state_writes(trace, &config, creation_tx.is_none())
+                .state_writes(trace, creation_tx.is_none())
                 .into_iter()
                 .map(|(name, value)| attribute(name, value)),
         );
