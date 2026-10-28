@@ -52,10 +52,6 @@ pub mod attrs {
     pub const EXECUTOR: &str = "executor";
 }
 
-/// Seconds between Base blocks, to project a snapshot's header to the block a quote lands in
-/// until the decoder applies the real execution block.
-const BLOCK_TIME_SECS: u64 = 2;
-
 pub fn hex_address(address: &Address) -> String {
     format!("0x{}", alloy::hex::encode(address))
 }
@@ -269,10 +265,9 @@ pub fn decode_biconomy_snapshot(
     let mut state = BiconomyState {
         venue: static_address(attrs::PAMM_ADDRESS)?,
         executor: static_address(attrs::EXECUTOR)?,
-        block: BlockEnvState {
-            number: header.number + 1,
-            timestamp: header.timestamp + BLOCK_TIME_SECS,
-        },
+        // As of the header; the stream decoder moves it to the execution block via
+        // `apply_block`, with the chain's block time and its flashblock handling.
+        block: BlockEnvState { number: header.number, timestamp: header.timestamp },
         ..Default::default()
     };
     apply_attributes(

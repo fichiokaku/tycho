@@ -212,8 +212,8 @@ mod tests {
     }
 
     #[test]
-    fn board_is_dark_when_the_provider_approves_another_executor() {
-        // The venue still quotes it, but the fill reverts with `NotApprovedExecutor`.
+    fn quote_fails_when_the_provider_approves_another_executor() {
+        // The venue still routes to the maker, and the fill reverts with `NotApprovedExecutor`.
         assert_dark_until_restored(
             vec![(format!("approved_executor/{PROVIDER}"), address_word(OTHER))],
             vec![(format!("approved_executor/{PROVIDER}"), address_word(EXECUTOR))],
@@ -295,6 +295,140 @@ mod tests {
 
         assert_eq!(state.paused.len(), 1);
         assert_eq!(state.balances.values().copied().max(), Some(U256::ZERO));
+    }
+
+    /// A venue state with one price board WETH -> USDC per maker, each maker with its own
+    /// balance provider holding plenty of USDC: `(size, price)` per maker in registry order.
+    fn makers_state(levels: &[(u128, u128)], approved: &[bool]) -> BiconomyState {
+        let mut attributes = HashMap::from([
+            ("fee_bps".to_owned(), Bytes::from(vec![0u8])),
+            ("maker_count".to_owned(), Bytes::from(vec![levels.len() as u8])),
+        ]);
+        for (i, ((size, price), ok)) in levels.iter().zip(approved).enumerate() {
+            let mm = format!("0x{:040x}", 0x1000 + i);
+            let provider = format!("0x{:040x}", 0x2000 + i);
+            let header = U256::from_str_radix(&provider[2..], 16).unwrap() |
+                (U256::from(10_000u64) << 160) |
+                (U256::from(1u8) << 200) |
+                (U256::from(1u8) << 208);
+            let board = |slot: u8| format!("board/{mm}/{WETH}/{USDC}/{slot}");
+            attributes.insert(format!("maker/{i}"), Bytes::from(mm.as_str()));
+            attributes.insert(board(0), word(header));
+            attributes.insert(board(2), word(U256::from(*size) | (U256::from(*price) << 128)));
+            attributes.insert(format!("provider/{provider}"), provider_config(0, None));
+            attributes.insert(format!("signer/{provider}"), address_word(&mm));
+            let executor =
+                if *ok { EXECUTOR } else { "0x0000000000000000000000000000000000000001" };
+            attributes.insert(format!("approved_executor/{provider}"), address_word(executor));
+            attributes.insert(format!("balance/{USDC}/{provider}"), word(U256::from(u64::MAX)));
+        }
+        let mut snap = snapshot();
+        snap.state.attributes = attributes;
+        decode_biconomy_snapshot(
+            &snap,
+            &BlockHeader { number: 99, timestamp: 1_000, ..Default::default() },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn get_limits_reports_what_quote_fillable_reports() {
+        let weth = token(WETH, "WETH", 18);
+        let usdc = token(USDC, "USDC", 6);
+        let limits = |state: &BiconomyState| {
+            state
+                .get_limits(Bytes::from(WETH), Bytes::from(USDC))
+                .unwrap()
+        };
+
+        // 100 wei at 1.0 and 1 wei at 0.6: the dust maker floors to zero and drops out, so the
+        // first plan covers 100, and the re-plan at 100 covers it again.
+        let state = makers_state(
+            &[(100, 1_000_000_000_000_000_000), (1, 600_000_000_000_000_000)],
+            &[true, true],
+        );
+        let (limit_in, limit_out) = limits(&state);
+        assert_eq!(
+            (limit_in.clone(), limit_out.clone()),
+            (BigUint::from(100u8), BigUint::from(100u8))
+        );
+        assert_eq!(
+            state
+                .get_amount_out(limit_in, &weth, &usdc)
+                .unwrap()
+                .amount,
+            limit_out
+        );
+
+        // Add 2 wei at 0.5: the first plan covers 102, but at 102 both dust makers floor to zero
+        // and only 100 is covered, so the venue's `quoteFillable` reports (0, 0) and so do we.
+        let state = makers_state(
+            &[
+                (100, 1_000_000_000_000_000_000),
+                (1, 600_000_000_000_000_000),
+                (2, 500_000_000_000_000_000),
+            ],
+            &[true, true, true],
+        );
+        assert_eq!(limits(&state), (BigUint::ZERO, BigUint::ZERO));
+        assert!(state
+            .get_amount_out(BigUint::from(102u8), &weth, &usdc)
+            .is_err());
+    }
+
+    #[test]
+    fn quote_fails_when_the_venue_would_route_to_a_provider_without_the_executor() {
+        // The better-priced maker's provider dropped the executor: the venue still allocates to
+        // it first and the swap reverts, rather than routing to the second maker.
+        let state = makers_state(
+            &[
+                (1_000_000_000_000_000_000, 2_000_000_000),
+                (1_000_000_000_000_000_000, 1_990_000_000),
+            ],
+            &[false, true],
+        );
+        let weth = token(WETH, "WETH", 18);
+        let usdc = token(USDC, "USDC", 6);
+        assert!(state
+            .get_amount_out(BigUint::from(1_000_000_000_000_000u64), &weth, &usdc)
+            .is_err());
+        assert_eq!(
+            state
+                .get_limits(Bytes::from(WETH), Bytes::from(USDC))
+                .unwrap(),
+            (BigUint::ZERO, BigUint::ZERO)
+        );
+    }
+
+    #[test]
+    fn spot_price_is_the_quote_needed_to_buy_one_base_with_the_fee_as_markup() {
+        // A USDC -> WETH board paying 1/2000 WETH per USDC: 5e14 raw WETH per 1e6 raw USDC, so
+        // 5e26 per 1e18 raw USDC. With the 10 bps fee, one WETH costs 2000 / 0.999 USDC.
+        let mut state = state();
+        let header = U256::from_str_radix(&PROVIDER[2..], 16).unwrap() |
+            (U256::from(10_000u64) << 160) |
+            (U256::from(1u8) << 200) |
+            (U256::from(1u8) << 208);
+        let level = U256::from(1_000_000_000u64) |
+            (U256::from(500_000_000_000_000_000_000_000_000u128) << 128);
+        state
+            .delta_transition(
+                delta(
+                    vec![
+                        (format!("board/{MM}/{USDC}/{WETH}/0"), word(header)),
+                        (format!("board/{MM}/{USDC}/{WETH}/2"), word(level)),
+                        (format!("balance/{WETH}/{PROVIDER}"), word(U256::from(10u128.pow(20)))),
+                    ],
+                    vec![],
+                ),
+                &HashMap::new(),
+                &Balances::default(),
+            )
+            .unwrap();
+        let price = state
+            .spot_price(&token(WETH, "WETH", 18), &token(USDC, "USDC", 6))
+            .unwrap();
+        assert!((price - 2_000.0 / 0.999).abs() < 1e-6, "{price}");
     }
 
     /// Rebuilds the state from the executor's and venue's raw storage on Base, the words the

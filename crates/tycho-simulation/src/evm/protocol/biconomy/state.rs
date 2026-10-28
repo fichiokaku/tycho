@@ -74,8 +74,8 @@ pub struct BiconomyState {
     pub providers: BTreeMap<String, ProviderConfig>,
     /// Each provider's `signer()`, by provider. A board is dark unless it is the maker.
     pub signers: BTreeMap<String, Address>,
-    /// Each provider's `approvedExecutor`, by provider. A board is dark unless it is the
-    /// executor: the venue would still quote it, but the fill reverts.
+    /// Each provider's `approvedExecutor`, by provider. `board()` does not check it, so the venue
+    /// still routes to the maker; a quote that allocates to it fails, as the swap would revert.
     pub approved_executors: BTreeMap<String, Address>,
     /// Each vault's router array length, by vault. `router()` is zero while it is empty.
     pub router_counts: BTreeMap<String, U256>,
@@ -158,13 +158,18 @@ impl BiconomyState {
         self.routers.get(&key).copied()
     }
 
-    /// Whether `provider` fills `mm`'s boards through this venue's executor: it names `mm` as
-    /// its signer and approves the executor.
-    fn serves(&self, provider: &Address, mm: &Address) -> bool {
+    /// Whether `provider` names `mm` as its signer, the only provider check `board()` makes.
+    fn signer_matches(&self, provider: &Address, mm: &Address) -> bool {
         let key = hex_address(provider);
-        self.providers.contains_key(&key) &&
-            self.signers.get(&key) == Some(mm) &&
-            self.approved_executors.get(&key) == Some(&self.executor)
+        self.providers.contains_key(&key) && self.signers.get(&key) == Some(mm)
+    }
+
+    /// Whether `provider` lets this venue's executor fill through it. `board()` does not check
+    /// it, so the venue still routes to the maker, and the fill then reverts.
+    fn approves_executor(&self, provider: &Address) -> bool {
+        self.approved_executors
+            .get(&hex_address(provider)) ==
+            Some(&self.executor)
     }
 
     fn env(&self) -> BlockEnv {
@@ -203,7 +208,7 @@ impl BiconomyState {
                 board: &board,
                 anchor: self.anchor(mm, token_in, token_out),
                 paused: self.paused.contains(mm),
-                provider_serves: self.serves(&board.provider, mm),
+                signer_matches: self.signer_matches(&board.provider, mm),
                 available_out: self.available(&board.provider, token_out),
             };
             views.push(board_view(&inputs, token_in, token_out, &env)?);
@@ -229,8 +234,27 @@ impl BiconomyState {
         if plan.covered < amount_in || plan.out.is_zero() {
             return Err(inactive());
         }
+        self.check_fillable(&boards, &plan)?;
         let gas = gas(&views, &plan);
         Ok((after_protocol_fee(plan.out, self.fee_bps), plan, boards, gas))
+    }
+
+    /// The venue routes to a maker whose provider no longer approves the executor, and the swap
+    /// then reverts with `FillLegFailed`. A plan that allocates to one cannot be executed.
+    fn check_fillable(&self, boards: &[Board], plan: &Plan) -> Result<(), SimulationError> {
+        let stuck = plan
+            .alloc
+            .iter()
+            .zip(boards)
+            .any(|(alloc, board)| !alloc.is_zero() && !self.approves_executor(&board.provider));
+        if stuck {
+            return Err(SimulationError::RecoverableError(
+                "Biconomy venue would route to a maker whose provider does not approve the \
+                 executor, so the swap reverts (FillLegFailed)"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// The state after the venue fills `plan`: each touched board's meters advance as the
@@ -357,12 +381,13 @@ impl ProtocolSim for BiconomyState {
     }
 
     fn spot_price(&self, base: &Token, quote: &Token) -> Result<f64, SimulationError> {
-        let token_in = address(&base.address)?;
-        let token_out = address(&quote.address)?;
+        // Buying `base` sells `quote` into the venue, so price the quote -> base boards.
+        let token_in = address(&quote.address)?;
+        let token_out = address(&base.address)?;
         let (_, views) = self
             .board_views(&token_in, &token_out)
             .map_err(pricing_error)?;
-        // The best level any live board would fill next.
+        // The best level any live board would fill next: the most base per quote.
         let best = views
             .iter()
             .filter(|view| !view.remaining.is_zero())
@@ -374,8 +399,14 @@ impl ProtocolSim for BiconomyState {
             .map(|level| level.price)
             .max()
             .ok_or_else(inactive)?;
-        let decimals = f64::from(base.decimals as i32 - quote.decimals as i32);
-        Ok(wad_to_f64(best) * 10f64.powf(decimals) * (1.0 - self.fee()))
+        // `best` is raw base per raw quote (1e18-scaled); invert to quote per base in whole
+        // tokens, then add the fee as a markup.
+        let base_per_quote =
+            wad_to_f64(best) * 10f64.powf(f64::from(quote.decimals as i32 - base.decimals as i32));
+        if base_per_quote <= 0.0 {
+            return Err(inactive());
+        }
+        Ok(1.0 / base_per_quote / (1.0 - self.fee()))
     }
 
     fn get_amount_out(
@@ -399,16 +430,37 @@ impl ProtocolSim for BiconomyState {
     ) -> Result<(BigUint, BigUint), SimulationError> {
         let tin = address(&sell_token)?;
         let tout = address(&buy_token)?;
-        let (_, views) = self
+        let (boards, views) = self
             .board_views(&tin, &tout)
             .map_err(pricing_error)?;
+        let none = (BigUint::ZERO, BigUint::ZERO);
         let room = views
             .iter()
             .fold(U256::ZERO, |sum, view| sum.saturating_add(view.remaining));
         if room.is_zero() {
-            return Ok((BigUint::ZERO, BigUint::ZERO));
+            return Ok(none);
         }
-        let plan = merge(&views, room);
+        // `PropAMMVenue.quoteFillable`: when the merge covers less than asked, price exactly the
+        // covered amount, and report nothing if that second plan does not cover it.
+        let mut plan = merge(&views, room);
+        if plan.covered < room {
+            let capacity = plan.covered;
+            if capacity.is_zero() {
+                return Ok(none);
+            }
+            plan = merge(&views, capacity);
+            if plan.covered != capacity {
+                return Ok(none);
+            }
+        }
+        // The venue would still quote a plan that routes to a provider that dropped the executor,
+        // but a swap at the limit would revert.
+        if plan.out.is_zero() ||
+            self.check_fillable(&boards, &plan)
+                .is_err()
+        {
+            return Ok(none);
+        }
         Ok((
             u256_to_biguint(plan.covered),
             u256_to_biguint(after_protocol_fee(plan.out, self.fee_bps)),
