@@ -506,6 +506,23 @@ pub(crate) mod config {
             assert!(Config::parse("venue=0x0000000000000000000000000000000000000001").is_err());
         }
 
+        #[test]
+        fn manifest_params_parse_with_every_token() {
+            let manifest = include_str!("../../base-biconomy.yaml");
+            let params: Vec<&str> = manifest
+                .lines()
+                .filter_map(|line| line.trim().split_once(": \""))
+                .filter(|(key, _)| key.starts_with("map_"))
+                .map(|(_, value)| value.trim_end_matches('"'))
+                .collect();
+            assert_eq!(params.len(), 3);
+            for value in params {
+                let config = Config::parse(value).unwrap();
+                assert_eq!(config.tokens.len(), 8);
+                assert_eq!(config.providers.len(), 2);
+            }
+        }
+
         fn addr(last: u8) -> Address {
             let mut a = [0u8; 20];
             a[19] = last;

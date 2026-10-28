@@ -8,7 +8,7 @@ makers keep in the PropAMM executor.
 |---|---|
 | Venue (`PropAMMVenue`) | `0x0000009E5F98cDB4dd1E1d2E15B220217c88B3b8` |
 | Executor (`PropAMMExecutor`) | `0x0000006f9bBA066e4efda2e0CAbE4FF8cf9030aC` |
-| Tokens | WETH `0x4200000000000000000000000000000000000006`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, cbBTC `0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf` |
+| Tokens | WETH `0x4200000000000000000000000000000000000006`, USDC `0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913`, cbBTC `0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf`, EURC `0x60a3E35Cc302bFA44Cb288Bc5a4F316Fdb1adb42`, USDT `0xfde4C96c8593536E31F229EA8f37b2ADa2699bb2`, cbETH `0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22`, wstETH `0xc1CBa3fCea344f92D9239c08C0568f6F2F0ee452`, AERO `0x940181a94A35A4569E4529A3CDfB74e38FD98631` |
 | Executor deployed | block 52547671 |
 | Venue deployed | block 52547680 |
 
@@ -88,9 +88,10 @@ keeps `router()` as the first element of a dynamic array at the given slot (slot
 Tempest vault), and the package follows that array. Both providers configured today keep the
 signer in slot 0 and `approvedExecutor` in slot 1.
 
-Token balance and allowance slots are given per token in the `tokens` param (WETH 3 and 4, USDC
-and cbBTC 9 and 10 on Base; USDC keeps a blacklist flag in the top bit of the balance word,
-which the simulation masks). Balances and allowances that predate `bootstrap_block` go in the
+Token balance and allowance slots are given per token in the `tokens` param. On Base: WETH 3 and
+4; USDC, cbBTC and EURC 9 and 10; USDT and AERO 0 and 1; wstETH 1 and 2; cbETH 51 and 52, each
+checked against holders' `balanceOf` and `allowance` on chain. USDC keeps a blacklist flag in the
+top bit of the balance word, which the simulation masks. Balances and allowances that predate `bootstrap_block` go in the
 `balances` and `allowances` params; none do for the providers configured today.
 
 A provider that is not in the params has no inventory, so its boards stay dark: the package can
