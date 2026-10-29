@@ -5,13 +5,15 @@ use std::{
 
 use alloy::primitives::U256;
 use num_bigint::BigUint;
+use num_traits::ToPrimitive;
 use tycho_common::{
     dto::ProtocolStateDelta,
     models::token::Token,
     simulation::{
         errors::{SimulationError, TransitionError},
         protocol_sim::{
-            Balances, BlockContext, GetAmountOutResult, PoolSwap, ProtocolSim, QueryPoolSwapParams,
+            Balances, BlockContext, GetAmountOutResult, PoolSwap, Price, ProtocolSim,
+            QueryPoolSwapParams, SwapConstraint,
         },
     },
     Bytes,
@@ -239,15 +241,18 @@ impl BiconomyState {
         Ok((after_protocol_fee(plan.out, self.fee_bps), plan, boards, gas))
     }
 
+    /// Whether the plan allocates to a maker whose provider no longer approves the executor.
+    fn routes_to_stuck_maker(&self, boards: &[Board], plan: &Plan) -> bool {
+        plan.alloc
+            .iter()
+            .zip(boards)
+            .any(|(alloc, board)| !alloc.is_zero() && !self.approves_executor(&board.provider))
+    }
+
     /// The venue routes to a maker whose provider no longer approves the executor, and the swap
     /// then reverts with `FillLegFailed`. A plan that allocates to one cannot be executed.
     fn check_fillable(&self, boards: &[Board], plan: &Plan) -> Result<(), SimulationError> {
-        let stuck = plan
-            .alloc
-            .iter()
-            .zip(boards)
-            .any(|(alloc, board)| !alloc.is_zero() && !self.approves_executor(&board.provider));
-        if stuck {
+        if self.routes_to_stuck_maker(boards, plan) {
             return Err(SimulationError::RecoverableError(
                 "Biconomy venue would route to a maker whose provider does not approve the \
                  executor, so the swap reverts (FillLegFailed)"
@@ -290,6 +295,88 @@ impl BiconomyState {
 }
 
 impl BiconomyState {
+    /// The largest amount up to `capacity` the venue fills in full without allocating to a maker
+    /// whose provider dropped the executor. The merge fills the best price first, so each maker's
+    /// allocation only grows with the amount, and a binary search finds where the merge first
+    /// reaches such a maker.
+    fn executable_capacity(&self, boards: &[Board], views: &[BoardView], capacity: U256) -> U256 {
+        let executable = |amount: U256| {
+            let plan = merge(views, amount);
+            plan.covered == amount && !self.routes_to_stuck_maker(boards, &plan)
+        };
+        if executable(capacity) {
+            return capacity;
+        }
+        largest_passing(capacity, executable)
+    }
+
+    /// `TradeLimitPrice`: the largest amount whose whole-trade price, net of the fee, is at least
+    /// `limit`. The merge fills the best price first, so that price only falls as the amount
+    /// grows. Compared in raw units, without f64 or decimal loss.
+    fn trade_limit_amount(&self, views: &[BoardView], limit: &Price, capacity: U256) -> U256 {
+        let meets = |amount: U256| {
+            let out = after_protocol_fee(merge(views, amount).out, self.fee_bps);
+            !out.is_zero() &&
+                u256_to_biguint(out) * &limit.denominator >=
+                    u256_to_biguint(amount) * &limit.numerator
+        };
+        if meets(capacity) {
+            return capacity;
+        }
+        largest_passing(capacity, meets)
+    }
+
+    /// `PoolTargetPrice`: the amount that moves the venue's marginal price for selling `token_in`
+    /// (the next level the forward merge would fill, net of the fee) down to `target`, within
+    /// `tolerance` above it. Levels are discrete, so when no level lands in that band the result
+    /// stops on the last level above it, the closest price not below `target`. When every amount
+    /// up to `capacity` stays above the band, the capped fill is returned, as LunarBase does.
+    fn target_price_amount(
+        &self,
+        views: &[BoardView],
+        target: &Price,
+        tolerance: f64,
+        capacity: U256,
+    ) -> Result<U256, SimulationError> {
+        // The marginal price net of the fee, over `target`: (price * (BPS - fee) / (WAD * BPS))
+        // / (numerator / denominator), as a numerator and denominator in raw units.
+        let fee_factor = BigUint::from(10_000u32 - u32::from(self.fee_bps));
+        let scale = BigUint::from(10u8).pow(18) * BigUint::from(10_000u32);
+        let versus_target = |price: U256| {
+            (u256_to_biguint(price) * &fee_factor * &target.denominator, &target.numerator * &scale)
+        };
+        let at_least_target = |price: U256| {
+            let (marginal, target) = versus_target(price);
+            marginal >= target
+        };
+        let within_band = |price: U256| {
+            let (marginal, target) = versus_target(price);
+            let ratio = marginal.to_f64().unwrap_or(f64::MAX) / target.to_f64().unwrap_or(f64::MAX);
+            ratio <= 1.0 + tolerance
+        };
+
+        let spot = marginal_after(views, U256::ZERO).ok_or_else(inactive)?;
+        if !at_least_target(spot) {
+            return Err(SimulationError::InvalidInput(
+                "Target is above the Biconomy venue's marginal price".to_owned(),
+                None,
+            ));
+        }
+        if within_band(spot) {
+            return Ok(U256::ZERO);
+        }
+        let reached = |amount: U256| marginal_after(views, amount).is_none_or(within_band);
+        if !reached(capacity) {
+            return Ok(capacity);
+        }
+        // The smallest amount that brings the marginal price into the band (or empties the book).
+        let amount = largest_passing(capacity, |amount| !reached(amount)) + U256::from(1u8);
+        Ok(match marginal_after(views, amount) {
+            Some(price) if !at_least_target(price) => amount - U256::from(1u8),
+            _ => amount,
+        })
+    }
+
     fn move_inventory(
         &mut self,
         provider: &Address,
@@ -333,6 +420,48 @@ impl BiconomyState {
             *entry = flags | value;
         }
     }
+}
+
+/// The largest amount in `[0, high)` for which `passes` holds, given that it holds for every amount
+/// below a boundary and fails from there on (`passes(0)` is taken as true, `passes(high)` as
+/// false).
+fn largest_passing(high: U256, passes: impl Fn(U256) -> bool) -> U256 {
+    let (mut low, mut high) = (U256::ZERO, high);
+    while high - low > U256::from(1u8) {
+        let mid = low + (high - low) / U256::from(2u8);
+        if passes(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
+
+/// The price (raw out per raw in, 1e18-scaled) of the next unit the venue would fill after
+/// `amount`: the best level any board still has room for. `None` once the book is used up.
+fn marginal_after(views: &[BoardView], amount: U256) -> Option<U256> {
+    let plan = merge(views, amount);
+    views
+        .iter()
+        .zip(&plan.alloc)
+        .filter(|(view, alloc)| view.remaining > **alloc)
+        .filter_map(|(view, alloc)| {
+            let cursor = view.filled + *alloc;
+            view.levels
+                .iter()
+                .find(|level| level.size > cursor)
+                .map(|level| level.price)
+        })
+        .max()
+}
+
+/// A swap amount as the venue takes it; Tycho amounts can exceed uint256.
+fn amount_u256(amount: &BigUint) -> Result<U256, SimulationError> {
+    if amount.bits() > 256 {
+        return Err(SimulationError::InvalidInput("amount_in exceeds uint256".to_owned(), None));
+    }
+    Ok(biguint_to_u256(amount))
 }
 
 fn gas(views: &[BoardView], plan: &Plan) -> BigUint {
@@ -417,8 +546,7 @@ impl ProtocolSim for BiconomyState {
     ) -> Result<GetAmountOutResult, SimulationError> {
         let tin = address(&token_in.address)?;
         let tout = address(&token_out.address)?;
-        let (amount_out, plan, boards, gas) =
-            self.quote(&tin, &tout, biguint_to_u256(&amount_in))?;
+        let (amount_out, plan, boards, gas) = self.quote(&tin, &tout, amount_u256(&amount_in)?)?;
         let next = self.after_fill(&tin, &tout, &plan, &boards);
         Ok(GetAmountOutResult::new(u256_to_biguint(amount_out), gas, Box::new(next)))
     }
@@ -453,13 +581,23 @@ impl ProtocolSim for BiconomyState {
                 return Ok(none);
             }
         }
-        // The venue would still quote a plan that routes to a provider that dropped the executor,
-        // but a swap at the limit would revert.
-        if plan.out.is_zero() ||
-            self.check_fillable(&boards, &plan)
-                .is_err()
-        {
+        if plan.out.is_zero() {
             return Ok(none);
+        }
+        // The venue still quotes a plan that routes to a provider that dropped the executor, but
+        // the swap reverts there: the limit stops where the merge would first reach one.
+        if self
+            .check_fillable(&boards, &plan)
+            .is_err()
+        {
+            let executable = self.executable_capacity(&boards, &views, plan.covered);
+            if executable.is_zero() {
+                return Ok(none);
+            }
+            plan = merge(&views, executable);
+            if plan.out.is_zero() {
+                return Ok(none);
+            }
         }
         Ok((
             u256_to_biguint(plan.covered),
@@ -487,8 +625,63 @@ impl ProtocolSim for BiconomyState {
         apply_attributes(self, changes).map_err(|err| TransitionError::DecodeError(err.to_string()))
     }
 
+    /// Walks the forward merge (the `token_in -> token_out` boards a fill moves) instead of the
+    /// generic search, which reads `spot_price` as the price of selling `token_in`; here that
+    /// comes from the reverse boards.
     fn query_pool_swap(&self, params: &QueryPoolSwapParams) -> Result<PoolSwap, SimulationError> {
-        crate::evm::query_pool_swap::query_pool_swap(self, params)
+        let (price, tolerance, min_amount_in, max_amount_in, trade_limit) = match params
+            .swap_constraint()
+        {
+            SwapConstraint::TradeLimitPrice { limit, tolerance, min_amount_in, max_amount_in } => {
+                (limit, *tolerance, min_amount_in, max_amount_in, true)
+            }
+            SwapConstraint::PoolTargetPrice { target, tolerance, min_amount_in, max_amount_in } => {
+                (target, *tolerance, min_amount_in, max_amount_in, false)
+            }
+        };
+        if price.numerator == BigUint::ZERO ||
+            price.denominator == BigUint::ZERO ||
+            !tolerance.is_finite() ||
+            tolerance < 0.0 ||
+            matches!((min_amount_in, max_amount_in), (Some(min), Some(max)) if min > max)
+        {
+            return Err(SimulationError::InvalidInput(
+                "invalid Biconomy price query bounds".to_owned(),
+                None,
+            ));
+        }
+        let token_in = params.token_in();
+        let token_out = params.token_out();
+        let zero = || PoolSwap::new(BigUint::ZERO, BigUint::ZERO, self.clone_box(), None);
+
+        let (max_in, _) = self.get_limits(token_in.address.clone(), token_out.address.clone())?;
+        let mut capacity = biguint_to_u256(&max_in);
+        if let Some(max) = max_amount_in {
+            if max.bits() <= 256 {
+                capacity = capacity.min(biguint_to_u256(max));
+            }
+        }
+        if capacity.is_zero() {
+            return Ok(zero());
+        }
+        let (_, views) = self
+            .board_views(&address(&token_in.address)?, &address(&token_out.address)?)
+            .map_err(pricing_error)?;
+        let amount = if trade_limit {
+            self.trade_limit_amount(&views, price, capacity)
+        } else {
+            self.target_price_amount(&views, price, tolerance, capacity)?
+        };
+        let amount = u256_to_biguint(amount);
+        if amount == BigUint::ZERO ||
+            min_amount_in
+                .as_ref()
+                .is_some_and(|min| amount < *min)
+        {
+            return Ok(zero());
+        }
+        let result = self.get_amount_out(amount.clone(), token_in, token_out)?;
+        Ok(PoolSwap::new(amount, result.amount, result.new_state, None))
     }
 
     fn clone_box(&self) -> Box<dyn ProtocolSim> {

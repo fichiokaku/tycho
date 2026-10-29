@@ -20,7 +20,9 @@ mod tests {
     use tycho_common::{
         dto::{ProtocolComponent, ProtocolStateDelta, ResponseProtocolState},
         models::{token::Token, Chain},
-        simulation::protocol_sim::{Balances, BlockContext, ProtocolSim},
+        simulation::protocol_sim::{
+            Balances, BlockContext, Price, ProtocolSim, QueryPoolSwapParams, SwapConstraint,
+        },
         Bytes,
     };
 
@@ -398,6 +400,156 @@ mod tests {
                 .unwrap(),
             (BigUint::ZERO, BigUint::ZERO)
         );
+    }
+
+    #[test]
+    fn get_limits_stop_where_the_venue_would_route_to_a_provider_without_the_executor() {
+        // The worse-priced maker's provider dropped the executor: the venue fills through the
+        // better maker up to its size and reverts only beyond it.
+        let state = makers_state(
+            &[
+                (1_000_000_000_000_000_000, 2_000_000_000),
+                (1_000_000_000_000_000_000, 1_990_000_000),
+            ],
+            &[true, false],
+        );
+        let weth = token(WETH, "WETH", 18);
+        let usdc = token(USDC, "USDC", 6);
+        let (limit_in, limit_out) = state
+            .get_limits(Bytes::from(WETH), Bytes::from(USDC))
+            .unwrap();
+        assert_eq!(limit_in, BigUint::from(1_000_000_000_000_000_000u64));
+        assert_eq!(limit_out, BigUint::from(2_000_000_000u64));
+        assert_eq!(
+            state
+                .get_amount_out(limit_in.clone(), &weth, &usdc)
+                .unwrap()
+                .amount,
+            limit_out
+        );
+        assert!(state
+            .get_amount_out(limit_in + 1u8, &weth, &usdc)
+            .is_err());
+    }
+
+    #[test]
+    fn get_amount_out_rejects_amounts_beyond_uint256() {
+        let state = makers_state(&[(1_000_000_000_000_000_000, 2_000_000_000)], &[true]);
+        let result = state.get_amount_out(
+            BigUint::from(1u8) << 256,
+            &token(WETH, "WETH", 18),
+            &token(USDC, "USDC", 6),
+        );
+        assert!(matches!(
+            result,
+            Err(tycho_common::simulation::errors::SimulationError::InvalidInput(..))
+        ));
+    }
+
+    /// 1 WETH at 2000 USDC and 1 WETH at 1990 USDC, WETH -> USDC only (no USDC -> WETH boards).
+    fn one_sided_book() -> BiconomyState {
+        makers_state(
+            &[
+                (1_000_000_000_000_000_000, 2_000_000_000),
+                (1_000_000_000_000_000_000, 1_990_000_000),
+            ],
+            &[true, true],
+        )
+    }
+
+    /// `usdc` USDC per `weth` WETH, in raw units.
+    fn usdc_per_weth(usdc: u64, weth: u64) -> Price {
+        Price::new(BigUint::from(usdc) * 1_000_000u32, BigUint::from(weth) * 10u64.pow(18))
+    }
+
+    fn query(
+        state: &BiconomyState,
+        constraint: SwapConstraint,
+    ) -> Result<(BigUint, BigUint), tycho_common::simulation::errors::SimulationError> {
+        state
+            .query_pool_swap(&QueryPoolSwapParams::new(
+                token(WETH, "WETH", 18),
+                token(USDC, "USDC", 6),
+                constraint,
+            ))
+            .map(|swap| (swap.amount_in().clone(), swap.amount_out().clone()))
+    }
+
+    fn trade_limit(limit: Price) -> SwapConstraint {
+        SwapConstraint::TradeLimitPrice {
+            limit,
+            tolerance: 0.0,
+            min_amount_in: None,
+            max_amount_in: None,
+        }
+    }
+
+    fn pool_target(target: Price, tolerance: f64) -> SwapConstraint {
+        SwapConstraint::PoolTargetPrice {
+            target,
+            tolerance,
+            min_amount_in: None,
+            max_amount_in: None,
+        }
+    }
+
+    #[test]
+    fn trade_limit_price_takes_the_largest_trade_at_or_above_the_limit() {
+        let state = one_sided_book();
+        let weth = BigUint::from(10u64.pow(18));
+
+        // Both levels average exactly 1995: the whole book.
+        let (amount_in, amount_out) = query(&state, trade_limit(usdc_per_weth(1995, 1))).unwrap();
+        assert_eq!((amount_in, amount_out), (&weth * 2u8, BigUint::from(3_990_000_000u64)));
+
+        // 1996 on average needs 2000 + 1990 * (x - 1) >= 1996 * x, so x <= 5/3 WETH; the output
+        // floors to whole micro-USDC, which costs up to 1e-6 USDC of margin (6 * dx >= 1e-6).
+        let limit = usdc_per_weth(1996, 1);
+        let (amount_in, amount_out) = query(&state, trade_limit(limit.clone())).unwrap();
+        assert!(amount_in <= BigUint::from(1_666_666_666_666_666_666u64));
+        assert!(amount_in > BigUint::from(1_666_666_400_000_000_000u64));
+        assert!(&amount_out * &limit.denominator >= &amount_in * &limit.numerator);
+        let beyond = &amount_in + 1_000_000_000_000u64;
+        let beyond_out = state
+            .get_amount_out(beyond.clone(), &token(WETH, "WETH", 18), &token(USDC, "USDC", 6))
+            .unwrap()
+            .amount;
+        assert!(beyond_out * &limit.denominator < beyond * &limit.numerator);
+
+        // Above the best level, nothing qualifies.
+        assert_eq!(
+            query(&state, trade_limit(usdc_per_weth(2001, 1))).unwrap(),
+            (BigUint::ZERO, BigUint::ZERO)
+        );
+    }
+
+    #[test]
+    fn pool_target_price_walks_the_forward_levels() {
+        let state = one_sided_book();
+        let weth = BigUint::from(10u64.pow(18));
+
+        // Already at the target: no trade.
+        assert_eq!(
+            query(&state, pool_target(usdc_per_weth(2000, 1), 0.0)).unwrap(),
+            (BigUint::ZERO, BigUint::ZERO)
+        );
+        // The second level is exactly the target: fill the first.
+        assert_eq!(
+            query(&state, pool_target(usdc_per_weth(1990, 1), 0.0)).unwrap(),
+            (weth.clone(), BigUint::from(2_000_000_000u64))
+        );
+        // No level lands in [1995, 1995]: stop on the last level above it, the closest price
+        // not below the target.
+        let (amount_in, _) = query(&state, pool_target(usdc_per_weth(1995, 1), 0.0)).unwrap();
+        assert_eq!(amount_in, &weth - 1u8);
+        // A tolerance wide enough to admit the second level fills the first.
+        let (amount_in, _) = query(&state, pool_target(usdc_per_weth(1980, 1), 0.01)).unwrap();
+        assert_eq!(amount_in, weth.clone());
+        // Below the whole book: take all of it.
+        let (amount_in, _) = query(&state, pool_target(usdc_per_weth(1000, 1), 0.0)).unwrap();
+        assert_eq!(amount_in, &weth * 2u8);
+        // Above the marginal price: unreachable by selling WETH.
+        assert!(query(&state, pool_target(usdc_per_weth(2001, 1), 0.0)).is_err());
     }
 
     #[test]
