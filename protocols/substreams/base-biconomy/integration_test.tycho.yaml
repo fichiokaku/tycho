@@ -20,10 +20,10 @@ tests:
           - "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
           - "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22"
           - "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452"
-          - "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+          - "0x3f5bf3edac59d650d8fdf9657a71f2f904a3a4ee"
         creation_tx: "0x3f3ca25c68af17bb8ca5ed326895186d17a842276efd356d98f56f234cee6cb9"
-  # From creation through the vault provider's onboarding and the maker list rewrites, up to the
-  # block before the vault provider's first fill, when its boards first have depth.
+  # From creation through the vault provider's onboarding and the maker list rewrites, to a few
+  # blocks after the vault provider's first fill (52839186), when its boards have depth.
   - name: test_vault_provider_and_maker_list
     start_block: 52547671
     stop_block: 52839191
@@ -37,5 +37,5 @@ tests:
           - "0xfde4c96c8593536e31f229ea8f37b2ada2699bb2"
           - "0x2ae3f1ec7f1f5012cfeab0185bfc7aa3cf0dec22"
           - "0xc1cba3fcea344f92d9239c08c0568f6f2f0ee452"
-          - "0x940181a94a35a4569e4529a3cdfb74e38fd98631"
+          - "0x3f5bf3edac59d650d8fdf9657a71f2f904a3a4ee"
         creation_tx: "0x3f3ca25c68af17bb8ca5ed326895186d17a842276efd356d98f56f234cee6cb9"

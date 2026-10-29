@@ -19,8 +19,9 @@ pub type Word = [u8; 32];
 
 pub const PROTOCOL_TYPE_NAME: &str = "biconomy_venue";
 pub const BOARD_WORDS: u8 = 24;
-/// Makers the venue's list is tracked for (`makerList` element slots precomputed per tx).
-pub const MAX_MAKERS: u8 = 64;
+/// Makers the venue's list is tracked for: the venue caps `makerList` at 16 (`MAX_MAKERS` in
+/// `PropAMMVenue.sol`). Their element slots are precomputed once per block.
+pub const MAX_MAKERS: u8 = 16;
 
 const BOARDS_SLOT: u8 = 0;
 const ANCHORS_SLOT: u8 = 1;
@@ -98,6 +99,29 @@ pub fn balance_slot(holder: &Address, base: u8) -> Word {
 /// `allowance[owner][spender]` for a token keeping allowances in a mapping at `base`.
 pub fn allowance_slot(owner: &Address, spender: &Address, base: u8) -> Word {
     mapping_slot(spender, &mapping_slot(owner, &root(base)))
+}
+
+/// Solady `ERC20`'s `_BALANCE_SLOT_SEED`.
+const SOLADY_BALANCE_SLOT_SEED: [u8; 4] = [0x87, 0xa2, 0x11, 0xa2];
+/// Solady `ERC20`'s `_ALLOWANCE_SLOT_SEED`.
+const SOLADY_ALLOWANCE_SLOT_SEED: [u8; 4] = [0x7f, 0x5e, 0x9f, 0x20];
+
+/// `balanceOf[holder]` for Solady's `ERC20`: keccak256(holder . uint96(_BALANCE_SLOT_SEED)).
+pub fn solady_balance_slot(holder: &Address) -> Word {
+    let mut buf = [0u8; 32];
+    buf[..20].copy_from_slice(holder);
+    buf[28..].copy_from_slice(&SOLADY_BALANCE_SLOT_SEED);
+    keccak(&buf)
+}
+
+/// `allowance[owner][spender]` for Solady's `ERC20`:
+/// keccak256(owner . uint96(_ALLOWANCE_SLOT_SEED) . spender).
+pub fn solady_allowance_slot(owner: &Address, spender: &Address) -> Word {
+    let mut buf = [0u8; 52];
+    buf[..20].copy_from_slice(owner);
+    buf[28..32].copy_from_slice(&SOLADY_ALLOWANCE_SLOT_SEED);
+    buf[32..].copy_from_slice(spender);
+    keccak(&buf)
 }
 
 /// The length slot of a dynamic array at `slot` and the slot of its first element.
@@ -292,6 +316,24 @@ mod tests {
 
         assert_eq!(hex::encode(balance_slot(&holder, 9)), BALANCE_SLOT_9);
         assert_eq!(hex::encode(allowance_slot(&vault, &holder, 10)), ALLOWANCE_SLOT_10);
+    }
+
+    #[test]
+    fn solady_slots_match_aero_on_base() {
+        // Read on Base from AERO 0x3f5bf3edac59d650d8fdf9657a71f2f904a3a4ee (Solady ERC20):
+        // `balanceOf` of 0x865d…b1d3 loads the first, and `allowance(vault, provider)` is
+        // keccak256(vault . uint96(seed) . provider).
+        let holder = address("0x865d8cab29e4003b9b512e2121fdc1660d66b1d3");
+        let vault = address("0x862ffacd6b13b4734bd8550c720f115f3f31e6ab");
+        let provider = address("0x25e864b4903fd3eebbfd723b905241ff98893595");
+        assert_eq!(
+            hex::encode(solady_balance_slot(&holder)),
+            "4fecda5ab456cad623dc2c466c63279b3eddcf2ada8101f0050c7300d8c7e5e4"
+        );
+        assert_eq!(
+            hex::encode(solady_allowance_slot(&vault, &provider)),
+            "bae7d51fb55e91efbfe5ad479b5941f70a49699b0342ca09df25bd6f7970530c"
+        );
     }
 
     const BALANCE_SLOT_9: &str = "9917b6e308075675a2ab72a7f97bb48b7392f98f9b0646fdf6f4a610dfb3ba7d";

@@ -10,15 +10,42 @@ pub(crate) mod config {
     use crate::biconomy::{
         address_word, allowance_attribute, allowance_slot, approved_executor_attribute,
         array_slots, balance_attribute, balance_slot, root, router_attribute,
-        router_count_attribute, signer_attribute, Address, Word,
+        router_count_attribute, signer_attribute, solady_allowance_slot, solady_balance_slot,
+        Address, Word,
     };
 
-    /// A token of the venue's pairs and where it keeps balances and allowances.
+    /// A tracked token and where it keeps balances and allowances.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub struct Token {
         pub address: Address,
-        pub balance_slot: u8,
-        pub allowance_slot: u8,
+        pub layout: TokenLayout,
+    }
+
+    /// How a token lays out its balances and allowances in storage.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TokenLayout {
+        /// Solidity mappings: `balanceOf` at `balance_slot`, `allowance` at `allowance_slot`.
+        Mapping { balance_slot: u8, allowance_slot: u8 },
+        /// Solady's `ERC20`, which derives both from fixed seeds.
+        Solady,
+    }
+
+    impl Token {
+        pub fn balance_slot(&self, holder: &Address) -> Word {
+            match self.layout {
+                TokenLayout::Mapping { balance_slot: base, .. } => balance_slot(holder, base),
+                TokenLayout::Solady => solady_balance_slot(holder),
+            }
+        }
+
+        pub fn allowance_slot(&self, owner: &Address, spender: &Address) -> Word {
+            match self.layout {
+                TokenLayout::Mapping { allowance_slot: base, .. } => {
+                    allowance_slot(owner, spender, base)
+                }
+                TokenLayout::Solady => solady_allowance_slot(owner, spender),
+            }
+        }
     }
 
     /// How a provider's `available(token)` is computed.
@@ -73,10 +100,13 @@ pub(crate) mod config {
     /// Params, `&`-separated:
     /// - `venue`, `executor`: addresses.
     /// - `bootstrap_block`: the block the component is created at (the venue's deployment).
-    /// - `tokens`: `address:balanceSlot:allowanceSlot`, comma-separated.
+    /// - `tokens`: `address:balanceSlot:allowanceSlot`, or `address:solady` for a token on Solady's
+    ///   `ERC20`, comma-separated. Tokens can be listed ahead of their pairs.
     /// - `providers`: `address:balance:signer`, `address:vault:signer:vault` or
-    ///   `address:unbounded:signer`, comma-separated. Every listed provider must approve `executor`
-    ///   as of `bootstrap_block`.
+    ///   `address:unbounded:signer`, comma-separated. Every listed provider starts out naming
+    ///   `signer` and approving `executor`. Providers in `provider_slots` are then followed from
+    ///   their storage writes, including a deployment after `bootstrap_block`; any other provider
+    ///   must keep both for good.
     /// - `provider_slots`: `provider:signerSlot:approvedExecutorSlot` for providers that can change
     ///   their signer or executor, comma-separated. Others are taken as immutable.
     /// - `vault_routers`: `vault:slot` where a vault keeps `router()` as the first element of a
@@ -245,16 +275,16 @@ pub(crate) mod config {
             for provider in &self.providers {
                 match provider.kind {
                     ProviderKind::Balance => slots.push((
-                        balance_slot(&provider.address, token.balance_slot),
+                        token.balance_slot(&provider.address),
                         balance_attribute(&token.address, &provider.address),
                     )),
                     ProviderKind::Vault(vault) => {
                         slots.push((
-                            balance_slot(&vault, token.balance_slot),
+                            token.balance_slot(&vault),
                             balance_attribute(&token.address, &vault),
                         ));
                         slots.push((
-                            allowance_slot(&vault, &provider.address, token.allowance_slot),
+                            token.allowance_slot(&vault, &provider.address),
                             allowance_attribute(&token.address, &vault, &provider.address),
                         ));
                     }
@@ -274,14 +304,22 @@ pub(crate) mod config {
 
     fn parse_token(entry: &str) -> Result<Token> {
         let parts: Vec<&str> = entry.split(':').collect();
-        let [address, balance_slot, allowance_slot] = parts.as_slice() else {
-            return Err(anyhow!("token `{entry}` is not address:balanceSlot:allowanceSlot"));
+        let (address, layout) = match parts.as_slice() {
+            [address, "solady"] => (address, TokenLayout::Solady),
+            [address, balance_slot, allowance_slot] => (
+                address,
+                TokenLayout::Mapping {
+                    balance_slot: balance_slot.parse()?,
+                    allowance_slot: allowance_slot.parse()?,
+                },
+            ),
+            _ => {
+                return Err(anyhow!(
+                    "token `{entry}` is not address:balanceSlot:allowanceSlot or address:solady"
+                ))
+            }
         };
-        Ok(Token {
-            address: parse_address(address)?,
-            balance_slot: balance_slot.parse()?,
-            allowance_slot: allowance_slot.parse()?,
-        })
+        Ok(Token { address: parse_address(address)?, layout })
     }
 
     fn parse_provider(entry: &str) -> Result<Provider> {
@@ -385,7 +423,7 @@ pub(crate) mod config {
         const PARAMS: &str = "venue=0x0000000000000000000000000000000000000001&\
              executor=0x0000000000000000000000000000000000000002&\
              bootstrap_block=10&\
-             tokens=0x0000000000000000000000000000000000000003:3:4,0x0000000000000000000000000000000000000004:9:10&\
+             tokens=0x0000000000000000000000000000000000000003:3:4,0x0000000000000000000000000000000000000004:9:10,0x000000000000000000000000000000000000000c:solady&\
              providers=0x0000000000000000000000000000000000000005:balance:0x0000000000000000000000000000000000000006,\
              0x0000000000000000000000000000000000000007:vault:0x0000000000000000000000000000000000000008:0x0000000000000000000000000000000000000009&\
              provider_slots=0x0000000000000000000000000000000000000007:0:1&\
@@ -402,8 +440,12 @@ pub(crate) mod config {
             assert_eq!(config.bootstrap_block, 10);
             assert_eq!(
                 config.tokens[1],
-                Token { address: addr(4), balance_slot: 9, allowance_slot: 10 }
+                Token {
+                    address: addr(4),
+                    layout: TokenLayout::Mapping { balance_slot: 9, allowance_slot: 10 }
+                }
             );
+            assert_eq!(config.tokens[2], Token { address: addr(12), layout: TokenLayout::Solady });
             assert_eq!(config.providers[0].kind, ProviderKind::Balance);
             assert_eq!(config.providers[1].kind, ProviderKind::Vault(addr(9)));
             assert_eq!(config.bootstrap.len(), 2);
