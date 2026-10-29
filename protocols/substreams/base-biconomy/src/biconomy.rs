@@ -114,6 +114,32 @@ pub fn solady_balance_slot(holder: &Address) -> Word {
     keccak(&buf)
 }
 
+/// Root of the `base.b20` ERC-7201 namespace that B20 tokens (Base's node-native token standard,
+/// e.g. the Coinbase tokenized stocks) keep their core storage in:
+/// keccak256(abi.encode(uint256(keccak256("base.b20")) - 1)) & ~bytes32(uint256(0xff)).
+/// `balances` is the mapping at offset 4 and `allowances` the one at offset 5.
+const B20_ROOT: Word = [
+    0xc7, 0x8b, 0x71, 0xfe, 0xe7, 0x95, 0xdd, 0xd7, 0x4a, 0xff, 0x64, 0xea, 0x9b, 0x24, 0x74, 0x19,
+    0x4c, 0x93, 0x8c, 0x31, 0x96, 0x43, 0x0e, 0x10, 0xbb, 0x5f, 0x01, 0xed, 0x48, 0x43, 0x40, 0x00,
+];
+
+/// `B20_ROOT` plus `offset`, which only touches the low byte the namespace mask cleared.
+fn b20_slot(offset: u8) -> Word {
+    let mut slot = B20_ROOT;
+    slot[31] = offset;
+    slot
+}
+
+/// `balanceOf[holder]` for a B20 token: the `balances` mapping at `base.b20` offset 4.
+pub fn b20_balance_slot(holder: &Address) -> Word {
+    mapping_slot(holder, &b20_slot(4))
+}
+
+/// `allowance[owner][spender]` for a B20 token: the `allowances` mapping at `base.b20` offset 5.
+pub fn b20_allowance_slot(owner: &Address, spender: &Address) -> Word {
+    mapping_slot(spender, &mapping_slot(owner, &b20_slot(5)))
+}
+
 /// `allowance[owner][spender]` for Solady's `ERC20`:
 /// keccak256(owner . uint96(_ALLOWANCE_SLOT_SEED) . spender).
 pub fn solady_allowance_slot(owner: &Address, spender: &Address) -> Word {
@@ -316,6 +342,42 @@ mod tests {
 
         assert_eq!(hex::encode(balance_slot(&holder, 9)), BALANCE_SLOT_9);
         assert_eq!(hex::encode(allowance_slot(&vault, &holder, 10)), ALLOWANCE_SLOT_10);
+    }
+
+    #[test]
+    fn b20_root_is_the_erc7201_namespace() {
+        let mut id = keccak(b"base.b20");
+        // uint256(keccak256("base.b20")) - 1
+        let mut i = 31;
+        loop {
+            let (value, borrow) = id[i].overflowing_sub(1);
+            id[i] = value;
+            if !borrow {
+                break;
+            }
+            i -= 1;
+        }
+        let mut root = keccak(&id);
+        root[31] = 0;
+        assert_eq!(root, B20_ROOT);
+    }
+
+    #[test]
+    fn b20_slots_match_nvdac_on_base() {
+        // Read on Base from NVDAc 0xb20000000000000000000078ee7ce2fe4908108c: `balanceOf` of
+        // 0x4446…a5ef loads the first slot, and `allowance(0x4d6a…6ca6, 0x4857…c60b)` reads the
+        // second (prestate trace and `eth_getStorageAt` against `allowance`).
+        let holder = address("0x4446adc0b8136ffc55ddb7a488ba5509ace2a5ef");
+        let owner = address("0x4d6ad10afb81a14268e632dd15c30c28b9266ca6");
+        let spender = address("0x4857db576ee0e45f10525ec59527bfd10beec60b");
+        assert_eq!(
+            hex::encode(b20_balance_slot(&holder)),
+            "7d89f3ea355dcd1268991cff176e733dab5fa1578fc4ca8eb82dca61caad04ea"
+        );
+        assert_eq!(
+            hex::encode(b20_allowance_slot(&owner, &spender)),
+            "89ec070e7d5441faa9115dd1461a1467a764f2ca1980761182ef4b16d67309b6"
+        );
     }
 
     #[test]

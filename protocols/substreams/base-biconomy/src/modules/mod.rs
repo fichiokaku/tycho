@@ -9,9 +9,9 @@ pub(crate) mod config {
 
     use crate::biconomy::{
         address_word, allowance_attribute, allowance_slot, approved_executor_attribute,
-        array_slots, balance_attribute, balance_slot, root, router_attribute,
-        router_count_attribute, signer_attribute, solady_allowance_slot, solady_balance_slot,
-        Address, Word,
+        array_slots, b20_allowance_slot, b20_balance_slot, balance_attribute, balance_slot, root,
+        router_attribute, router_count_attribute, signer_attribute, solady_allowance_slot,
+        solady_balance_slot, Address, Word,
     };
 
     /// A tracked token and where it keeps balances and allowances.
@@ -28,6 +28,8 @@ pub(crate) mod config {
         Mapping { balance_slot: u8, allowance_slot: u8 },
         /// Solady's `ERC20`, which derives both from fixed seeds.
         Solady,
+        /// A B20 token (Base's node-native standard): mappings in the `base.b20` namespace.
+        B20,
     }
 
     impl Token {
@@ -35,6 +37,7 @@ pub(crate) mod config {
             match self.layout {
                 TokenLayout::Mapping { balance_slot: base, .. } => balance_slot(holder, base),
                 TokenLayout::Solady => solady_balance_slot(holder),
+                TokenLayout::B20 => b20_balance_slot(holder),
             }
         }
 
@@ -44,6 +47,7 @@ pub(crate) mod config {
                     allowance_slot(owner, spender, base)
                 }
                 TokenLayout::Solady => solady_allowance_slot(owner, spender),
+                TokenLayout::B20 => b20_allowance_slot(owner, spender),
             }
         }
     }
@@ -100,8 +104,9 @@ pub(crate) mod config {
     /// Params, `&`-separated:
     /// - `venue`, `executor`: addresses.
     /// - `bootstrap_block`: the block the component is created at (the venue's deployment).
-    /// - `tokens`: `address:balanceSlot:allowanceSlot`, or `address:solady` for a token on Solady's
-    ///   `ERC20`, comma-separated. Tokens can be listed ahead of their pairs.
+    /// - `tokens`: `address:balanceSlot:allowanceSlot`, `address:solady` for a token on Solady's
+    ///   `ERC20`, or `address:b20` for a B20 token, comma-separated. Tokens can be listed ahead of
+    ///   their pairs.
     /// - `providers`: `address:balance:signer`, `address:vault:signer:vault` or
     ///   `address:unbounded:signer`, comma-separated. Every listed provider starts out naming
     ///   `signer` and approving `executor`. Providers in `provider_slots` are then followed from
@@ -306,6 +311,7 @@ pub(crate) mod config {
         let parts: Vec<&str> = entry.split(':').collect();
         let (address, layout) = match parts.as_slice() {
             [address, "solady"] => (address, TokenLayout::Solady),
+            [address, "b20"] => (address, TokenLayout::B20),
             [address, balance_slot, allowance_slot] => (
                 address,
                 TokenLayout::Mapping {
@@ -315,7 +321,8 @@ pub(crate) mod config {
             ),
             _ => {
                 return Err(anyhow!(
-                    "token `{entry}` is not address:balanceSlot:allowanceSlot or address:solady"
+                    "token `{entry}` is not address:balanceSlot:allowanceSlot, address:solady or \
+                     address:b20"
                 ))
             }
         };
@@ -423,7 +430,7 @@ pub(crate) mod config {
         const PARAMS: &str = "venue=0x0000000000000000000000000000000000000001&\
              executor=0x0000000000000000000000000000000000000002&\
              bootstrap_block=10&\
-             tokens=0x0000000000000000000000000000000000000003:3:4,0x0000000000000000000000000000000000000004:9:10,0x000000000000000000000000000000000000000c:solady&\
+             tokens=0x0000000000000000000000000000000000000003:3:4,0x0000000000000000000000000000000000000004:9:10,0x000000000000000000000000000000000000000c:solady,0x000000000000000000000000000000000000000d:b20&\
              providers=0x0000000000000000000000000000000000000005:balance:0x0000000000000000000000000000000000000006,\
              0x0000000000000000000000000000000000000007:vault:0x0000000000000000000000000000000000000008:0x0000000000000000000000000000000000000009&\
              provider_slots=0x0000000000000000000000000000000000000007:0:1&\
@@ -446,6 +453,7 @@ pub(crate) mod config {
                 }
             );
             assert_eq!(config.tokens[2], Token { address: addr(12), layout: TokenLayout::Solady });
+            assert_eq!(config.tokens[3], Token { address: addr(13), layout: TokenLayout::B20 });
             assert_eq!(config.providers[0].kind, ProviderKind::Balance);
             assert_eq!(config.providers[1].kind, ProviderKind::Vault(addr(9)));
             assert_eq!(config.bootstrap.len(), 2);
@@ -560,7 +568,7 @@ pub(crate) mod config {
             assert_eq!(params.len(), 3);
             for value in params {
                 let config = Config::parse(value).unwrap();
-                assert_eq!(config.tokens.len(), 8);
+                assert_eq!(config.tokens.len(), 18);
                 assert_eq!(config.providers.len(), 2);
             }
         }
